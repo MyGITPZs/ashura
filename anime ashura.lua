@@ -1,76 +1,269 @@
-﻿-- =======================================================
--- Anime Ashura [UPD 05] - All-in-One Auto Script v2.0
--- (Save/Load Settings, Auto Claim, Auto Code, Auto Summon,
---  Merchant & Currency Shop + Restock Exit, Enhanced Auto Farm)
+-- =======================================================
+-- Anime Ashura [UPD 05] - All-in-One Auto Script v2.1 MOBILE
+-- เวอร์ชันมือถือ (Delta Android / iOS) เน้นความเสถียร
+--
+-- สิ่งที่เปลี่ยนจาก v2.0:
+--   * UI เป็นหน้าต่างเดียวแบบแท็บ ขนาดปรับตามจอ และจัดใหม่เองเมื่อหมุนจอ
+--   * ลากหน้าต่างด้วยนิ้วได้ (เลิกใช้ Draggable ที่ Roblox เลิกรองรับแล้ว)
+--   * มีปุ่มลอย "AH" สำหรับย่อ/ขยายเมนู และจำสถานะย่อไว้ข้ามเซิร์ฟ
+--   * รันสคริปต์ซ้ำได้: ลูปเก่าจะถูกหยุดก่อน ไม่ซ้อนกัน
+--   * ทุกการเรียก Remote มี timeout จึงไม่ค้างตลอดไปเมื่อเน็ตมือถือหลุด
+--   * ลูปเบื้องหลังทุกตัวห่อด้วย pcall จึงไม่ตายเมื่อเจอ error
+--   * สถานะ Restock ถูกบันทึกลงไฟล์ จึงซื้อของต่อได้หลังวาร์ปกลับ Lobby
+--   * กดปุ่มในเกมได้หลายวิธี: getconnections → firesignal → VirtualInputManager
+--
+-- ถ้าต้องการให้ Auto Farm ทำงานต่อหลังวาร์ประหว่าง Lobby กับด่าน
+-- ให้ใส่ไฟล์นี้ไว้ในโฟลเดอร์ Autoexecute ของ Delta
 -- =======================================================
 
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+-- ==========================================
+-- 0. SESSION: ป้องกันการรันซ้ำแล้วลูปซ้อนกัน
+-- ==========================================
+if type(_G.__AAH_CLEANUP) == "function" then
+    pcall(_G.__AAH_CLEANUP)
+end
+
+local SESSION = { dead = false }
+local trackedConns = {}
+local screenGui = nil
+
+local function alive()
+    return not SESSION.dead
+end
+
+local function track(conn)
+    if conn then
+        table.insert(trackedConns, conn)
+    end
+    return conn
+end
+
+-- ฟังก์ชันนี้หยุดทุกลูปของรอบนี้และลบ GUI ทิ้ง (ถูกเรียกตอนรันซ้ำหรือกดปิดสคริปต์)
+_G.__AAH_CLEANUP = function()
+    SESSION.dead = true
+    for _, c in ipairs(trackedConns) do
+        pcall(function() c:Disconnect() end)
+    end
+    trackedConns = {}
+    if screenGui then
+        pcall(function() screenGui:Destroy() end)
+        screenGui = nil
+    end
+end
+
+-- รอแบบแบ่งช่วงสั้นๆ ถ้าสคริปต์ถูกปิดระหว่างรอจะหลุดออกทันทีและคืนค่า false
+local function sleep(sec)
+    local t0 = os.clock()
+    while alive() and os.clock() - t0 < sec do
+        task.wait(math.min(0.25, sec))
+    end
+    return alive()
+end
+
+-- ==========================================
+-- 1. SERVICES
+-- ==========================================
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local StarterGui = game:GetService("StarterGui")
-local VirtualUser = game:GetService("VirtualUser")
 local CollectionService = game:GetService("CollectionService")
 local HttpService = game:GetService("HttpService")
+local UserInputService = game:GetService("UserInputService")
+local GuiService = game:GetService("GuiService")
+local TeleportService = game:GetService("TeleportService")
+
+local VirtualUser, VIM = nil, nil
+pcall(function() VirtualUser = game:GetService("VirtualUser") end)
+pcall(function() VIM = game:GetService("VirtualInputManager") end)
 
 local LocalPlayer = Players.LocalPlayer
-local Kingdom = ReplicatedStorage:WaitForChild("Kingdom", 15)
+while not LocalPlayer do
+    task.wait(0.1)
+    LocalPlayer = Players.LocalPlayer
+end
+
+local LOBBY_PLACE = 81532592154280
+local BATTLE_PLACE = 112575319532871
+local IN_BATTLE = (game.PlaceId == BATTLE_PLACE)
+
+-- ==========================================
+-- 2. STATUS / NOTIFY / LOOP HELPERS
+-- ==========================================
+local statusLabel = nil
+local lastNotify = {}
+local notifyCount = 0
+
+local function setStatus(text)
+    if statusLabel then
+        pcall(function() statusLabel.Text = tostring(text) end)
+    end
+end
+
+-- แจ้งเตือนแบบกันสแปม: ข้อความเดิมภายใน 4 วินาทีจะไม่เด้งซ้ำ (บนมือถือแจ้งเตือนบังจอ)
+local function notify(title, text, duration)
+    title = tostring(title or "Anime Ashura")
+    text = tostring(text or "")
+    setStatus(title .. " • " .. text)
+
+    local key = title .. "|" .. text
+    local now = os.clock()
+    if lastNotify[key] and now - lastNotify[key] < 4 then
+        return
+    end
+    notifyCount = notifyCount + 1
+    if notifyCount > 100 then
+        lastNotify = {}
+        notifyCount = 0
+    end
+    lastNotify[key] = now
+
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = title,
+            Text = text,
+            Duration = duration or 3
+        })
+    end)
+end
+
+-- ลูปเบื้องหลังที่ไม่ตายเมื่อเจอ error และหยุดเองเมื่อสคริปต์ถูกปิด
+local function loop(name, interval, fn)
+    task.spawn(function()
+        while alive() do
+            local ok, err = pcall(fn)
+            if not ok then
+                warn("[AAH:" .. name .. "] " .. tostring(err))
+            end
+            if not sleep(interval) then
+                break
+            end
+        end
+    end)
+end
+
+-- ==========================================
+-- 3. REMOTES (มี timeout)
+-- ==========================================
+local Kingdom = ReplicatedStorage:WaitForChild("Kingdom", 20)
 if not Kingdom then
-    warn("[AutoScript] ไม่พบโฟลเดอร์ Kingdom!")
+    notify("Anime Ashura", "ไม่พบโฟลเดอร์ Kingdom (เกมอาจอัปเดต)", 6)
+    warn("[AAH] ไม่พบโฟลเดอร์ Kingdom!")
     return
 end
 
-local Remotes = Kingdom:WaitForChild("Remotes", 10)
-local Request = Remotes:WaitForChild("Request", 10)
+local Remotes = Kingdom:WaitForChild("Remotes", 15)
+local Request = Remotes and Remotes:WaitForChild("Request", 15)
+if not Request then
+    notify("Anime Ashura", "ไม่พบ Remote Request (เกมอาจอัปเดต)", 6)
+    warn("[AAH] ไม่พบ Kingdom.Remotes.Request!")
+    return
+end
+
+local function safeRequire(name)
+    local mod = Kingdom:WaitForChild(name, 5)
+    if not mod then
+        return nil
+    end
+    local ok, res = pcall(require, mod)
+    if ok then
+        return res
+    end
+    warn("[AAH] require " .. name .. " ไม่สำเร็จ: " .. tostring(res))
+    return nil
+end
 
 -- โหลด Config และ Goals
-local Config = pcall(function() return require(Kingdom:WaitForChild("Config", 5)) end) and require(Kingdom.Config) or nil
-local Goals = pcall(function() return require(Kingdom:WaitForChild("Goals", 5)) end) and require(Kingdom.Goals) or nil
+local Config = safeRequire("Config")
+local Goals = safeRequire("Goals")
+
+local REMOTE_TIMEOUT = 10
+
+-- เรียก Request:InvokeServer แบบมี timeout คืนค่า (ok, result)
+-- ถ้าเซิร์ฟเวอร์ไม่ตอบภายใน REMOTE_TIMEOUT วินาที จะคืน (false, "timeout") แทนการค้าง
+local function call(name, ...)
+    local args = { ... }
+    local n = select("#", ...)
+    local done, okRes, result = false, false, nil
+
+    task.spawn(function()
+        local ok, res = pcall(function()
+            return Request:InvokeServer(name, table.unpack(args, 1, n))
+        end)
+        if not done then
+            done = true
+            okRes, result = ok, res
+            if not ok then
+                warn("[AAH:Remote] " .. tostring(name) .. " -> " .. tostring(res))
+            end
+        end
+    end)
+
+    local t0 = os.clock()
+    while not done and os.clock() - t0 < REMOTE_TIMEOUT do
+        task.wait(0.05)
+    end
+    if not done then
+        done = true
+        warn("[AAH:Remote] " .. tostring(name) .. " timeout")
+        return false, "timeout"
+    end
+    return okRes, result
+end
 
 -- ==========================================
--- ระบบ SAVE / LOAD ตั้งค่า (Persistent Settings)
+-- 4. ระบบ SAVE / LOAD ตั้งค่า (Persistent Settings)
 -- ==========================================
 local SETTINGS_FILE = "AnimeAshura_Settings.json"
+local canFile = (type(writefile) == "function" and type(readfile) == "function")
 
 local function saveSettings(data)
+    if not canFile then
+        return false
+    end
     local ok, err = pcall(function()
-        local json = HttpService:JSONEncode(data)
-        writefile(SETTINGS_FILE, json)
+        writefile(SETTINGS_FILE, HttpService:JSONEncode(data))
     end)
     if not ok then
         warn("[SaveSettings] บันทึกไม่สำเร็จ: " .. tostring(err))
     end
+    return ok
 end
 
 local function loadSettings()
-    local ok, result = pcall(function()
-        local exists = false
-        if pcall(function() return isfile(SETTINGS_FILE) end) then
-            exists = isfile(SETTINGS_FILE)
-        else
-            local test = pcall(function() return readfile(SETTINGS_FILE) end)
-            exists = test
-        end
-        if exists then
-            local raw = readfile(SETTINGS_FILE)
-            if raw and raw ~= "" then
-                return HttpService:JSONDecode(raw)
-            end
-        end
+    if not canFile then
         return nil
+    end
+    local ok, result = pcall(function()
+        if type(isfile) == "function" and not isfile(SETTINGS_FILE) then
+            return nil
+        end
+        local raw = readfile(SETTINGS_FILE)
+        if type(raw) ~= "string" or raw == "" then
+            return nil
+        end
+        return HttpService:JSONDecode(raw)
     end)
-    if ok and result and type(result) == "table" then
+    if ok and type(result) == "table" then
         return result
     end
     return nil
 end
 
+-- รวมค่าที่บันทึกกับค่าเริ่มต้น: ถ้าชนิดข้อมูลไม่ตรง (ไฟล์เสีย) จะใช้ค่าเริ่มต้นแทน
 local function mergeDefaults(saved, defaults)
-    if not saved then return defaults end
+    local out = {}
     for k, v in pairs(defaults) do
-        if saved[k] == nil then
-            saved[k] = v
+        if type(saved) == "table" and saved[k] ~= nil and type(saved[k]) == type(v) then
+            out[k] = saved[k]
+        else
+            out[k] = v
         end
     end
-    return saved
+    return out
 end
 
 -- ค่าเริ่มต้นทั้งหมด
@@ -110,37 +303,35 @@ local defaultGeneralConfig = {
     stopOnMythicOrSecret = true,
     autoSellRare = true,
     autoSellEpic = false,
-    isAutoShopLoop = false,
     isAutoClaimLoop = false,
-    restockExitBattle = true  -- ✨ ระบบออกจากด่านเมื่อร้านค้ารีเซ็ต
+    isAutoShopLoop = false,
+    restockExitBattle = true,  -- ✨ ระบบออกจากด่านเมื่อร้านค้ารีเซ็ต
+    restockPending = false,    -- ✨ จำไว้ข้ามเซิร์ฟว่ายังต้องกลับไปซื้อของ
+    uiMinimized = false        -- ✨ จำว่าย่อเมนูไว้หรือไม่ (ไม่บังจอหลังวาร์ป)
 }
 
 -- โหลดค่าที่บันทึกไว้ (ถ้ามี)
 local savedData = loadSettings()
-local savedFarm = savedData and savedData.farm or nil
-local savedMerchant = savedData and savedData.merchant or nil
-local savedCurrency = savedData and savedData.currency or nil
-local savedGeneral = savedData and savedData.general or nil
 
--- ระบบ Anti-AFK ป้องกันโดนเตะ 20 นาที
-LocalPlayer.Idled:Connect(function()
-    VirtualUser:CaptureController()
-    VirtualUser:ClickButton2(Vector2.new())
-end)
-
-local function notify(title, text, duration)
+-- ==========================================
+-- 5. ระบบ Anti-AFK ป้องกันโดนเตะ 20 นาที
+-- ==========================================
+track(LocalPlayer.Idled:Connect(function()
+    if not VirtualUser then
+        return
+    end
     pcall(function()
-        StarterGui:SetCore("SendNotification", {
-            Title = title or "Anime Ashura",
-            Text = text or "",
-            Duration = duration or 3
-        })
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new())
     end)
-end
+end))
 
 -- ฟังก์ชันช่วยคำนวณเวลานับถอยหลัง (HH:MM:SS)
 local function formatClock(seconds)
-    if not seconds or seconds <= 0 then return "00:00:00" end
+    seconds = tonumber(seconds)
+    if not seconds or seconds <= 0 then
+        return "00:00:00"
+    end
     local h = math.floor(seconds / 3600)
     local m = math.floor((seconds % 3600) / 60)
     local s = math.floor(seconds % 60)
@@ -149,12 +340,14 @@ end
 
 local function getServerTime()
     local ok, t = pcall(function() return workspace:GetServerTimeNow() end)
-    if ok and t then return math.floor(t) end
+    if ok and t then
+        return math.floor(t)
+    end
     return os.time()
 end
 
 -- ==========================================
--- ฐานข้อมูลด่านและแมพ (Stage Database)
+-- 6. ฐานข้อมูลด่านและแมพ (Stage Database)
 -- ==========================================
 local stageDB = {
     Story = {
@@ -267,61 +460,83 @@ local currencyShopDB = {
     }
 }
 
+local MODES = {
+    { id = "Story", text = "Story" },
+    { id = "Raid", text = "Raid" },
+    { id = "Castle", text = "Castle" },
+    { id = "Challenge", text = "Challenge" }
+}
+
+local DIFFS = {
+    { id = "Easy", text = "Easy", color = Color3.fromRGB(46, 204, 113) },
+    { id = "Medium", text = "Medium", color = Color3.fromRGB(241, 196, 15) },
+    { id = "Hard", text = "Hard", color = Color3.fromRGB(231, 76, 60) }
+}
+local DIFF_COLOR = {}
+for _, d in ipairs(DIFFS) do
+    DIFF_COLOR[d.id] = d.color
+end
+
 -- ==========================================
--- ตัวแปรสถานะ (โหลดจากไฟล์ที่บันทึก)
+-- 7. ตัวแปรสถานะ (โหลดจากไฟล์ที่บันทึก)
 -- ==========================================
-local generalConfig = mergeDefaults(savedGeneral, defaultGeneralConfig)
-local stopOnMythicOrSecret = (generalConfig.stopOnMythicOrSecret ~= false)
-local autoSellRare = (generalConfig.autoSellRare ~= false)
-local autoSellEpic = (generalConfig.autoSellEpic == true)
-local isAutoClaimLoop = (generalConfig.isAutoClaimLoop == true)
-local isAutoShopLoop = (generalConfig.isAutoShopLoop == true)
-local isAutoSummoning = false
-
--- ตัวแปร Merchant & Currency Shop
-local cachedMerchantInfo = nil
-
-local merchantConfig = mergeDefaults(savedMerchant, defaultMerchantConfig)
-local currencyShopConfig = mergeDefaults(savedCurrency, defaultCurrencyShopConfig)
-
--- ตัวแปรระบบ AUTO PLAY / AUTO FARM ขั้นสูง (โหลดจากไฟล์ที่บันทึก)
-local farmCfg = mergeDefaults(savedFarm, defaultFarmConfig)
+local G = mergeDefaults(savedData and savedData.general, defaultGeneralConfig)
+local merchantConfig = mergeDefaults(savedData and savedData.merchant, defaultMerchantConfig)
+local currencyShopConfig = mergeDefaults(savedData and savedData.currency, defaultCurrencyShopConfig)
+local farmCfg = mergeDefaults(savedData and savedData.farm, defaultFarmConfig)
 _G.AnimeAshura_AutoFarm = farmCfg
 
--- ✨ ระบบ Restock Exit Battle
-local restockExitBattle = generalConfig.restockExitBattle
-local _restockPending = false  -- แฟล็กบอกว่ามี restock ค้างอยู่ ต้องกลับ lobby ไปซื้อ
+local state = {
+    summonToken = nil,
+    startingRoom = false,
+    lastStartAttempt = 0,
+    teleporting = false,
+    teleportAt = 0,
+    restockSince = nil
+}
+
+local cachedMerchantInfo = nil
+
+local function worldData(mode, world)
+    local m = stageDB[mode]
+    return m and m[world] or nil
+end
+
+local function stageCount(mode, world)
+    local w = worldData(mode, world)
+    return (w and w.Stages and #w.Stages) or 0
+end
+
+-- แก้ค่าที่ไม่ถูกต้อง เช่น เลือก World 3 ใน Raid ที่มีแค่ World 1
+local function sanitizeFarm()
+    if not stageDB[farmCfg.Mode] then
+        farmCfg.Mode = "Story"
+    end
+    farmCfg.World = tonumber(farmCfg.World) or 1
+    if not worldData(farmCfg.Mode, farmCfg.World) then
+        farmCfg.World = 1
+    end
+    farmCfg.Stage = tonumber(farmCfg.Stage) or 1
+    local n = stageCount(farmCfg.Mode, farmCfg.World)
+    if farmCfg.Stage < 1 or farmCfg.Stage > n then
+        farmCfg.Stage = 1
+    end
+    if not DIFF_COLOR[farmCfg.Difficulty] then
+        farmCfg.Difficulty = "Easy"
+    end
+end
+sanitizeFarm()
 
 -- ==========================================
 -- ✨ ฟังก์ชันบันทึกตั้งค่าปัจจุบันลงไฟล์
 -- ==========================================
 local function persistCurrentSettings()
-    local cfg = _G.AnimeAshura_AutoFarm or {}
-    local data = {
-        farm = {
-            Enabled = (cfg.Enabled == true),
-            Mode = cfg.Mode or "Story",
-            World = tonumber(cfg.World) or 1,
-            Stage = tonumber(cfg.Stage) or 1,
-            Difficulty = cfg.Difficulty or "Easy",
-            Solo = (cfg.Solo ~= false),
-            AutoSkills = (cfg.AutoSkills ~= false),
-            AutoReplay = (cfg.AutoReplay == true),
-            AutoNext = (cfg.AutoNext == true),
-            LowGraphics = (cfg.LowGraphics ~= false)
-        },
+    return saveSettings({
+        farm = farmCfg,
         merchant = merchantConfig,
         currency = currencyShopConfig,
-        general = {
-            isAutoClaimLoop = (isAutoClaimLoop == true),
-            isAutoShopLoop = (isAutoShopLoop == true),
-            stopOnMythicOrSecret = (stopOnMythicOrSecret ~= false),
-            autoSellRare = (autoSellRare ~= false),
-            autoSellEpic = (autoSellEpic == true),
-            restockExitBattle = (restockExitBattle ~= false)
-        }
-    }
-    saveSettings(data)
+        general = G
+    })
 end
 
 -- ==========================================
@@ -329,7 +544,9 @@ end
 -- ==========================================
 local _saveQueued = false
 local function queueSave()
-    if _saveQueued then return end
+    if _saveQueued then
+        return
+    end
     _saveQueued = true
     task.delay(1, function()
         _saveQueued = false
@@ -337,213 +554,202 @@ local function queueSave()
     end)
 end
 
--- UI References
-local summonBtn = nil
-local loopClaimBtn = nil
-local stopToggleBtn = nil
-local shopFrame = nil
-local loopShopBtn = nil
-local merchantTimerLabel = nil
-local stockContainer = nil
-local currencyContainer = nil
-local autoFarmFrame = nil
-local farmLoopBtn = nil
-local farmInfoLabel = nil
-local autoSkillsBtn = nil
-local autoReplayBtn = nil
-local autoNextBtn = nil
-local lowGfxBtn = nil
+-- ตัวรีเฟรช UI ที่ถูกกำหนดค่าจริงตอนสร้าง GUI
+local refreshSummonToggle = function() end
 
-local function updateSummonUI(enabled)
-    if not summonBtn then return end
-    if enabled then
-        summonBtn.Text = "🎰 Auto Summon 10x: [ เปิดใช้งาน ]"
-        summonBtn.BackgroundColor3 = Color3.fromRGB(46, 204, 113)
-    else
-        summonBtn.Text = "🎰 Auto Summon 10x (Skip): [ ปิด ]"
-        summonBtn.BackgroundColor3 = Color3.fromRGB(45, 42, 55)
+-- ==========================================
+-- 8. ฟังก์ชัน AUTO CLAIM เควสทุกอย่าง
+-- ==========================================
+local claimBusy = false
+local function claimAllEverything(silent)
+    if claimBusy then
+        if not silent then setStatus("🎁 กำลังรับรางวัลอยู่แล้ว...") end
+        return
     end
-end
+    claimBusy = true
+    setStatus("🎁 กำลังกดรับรางวัล...")
 
--- ==========================================
--- 1. ฟังก์ชัน AUTO CLAIM เควสทุกอย่าง
--- ==========================================
-local function claimAllEverything()
-    pcall(function() Request:InvokeServer("ClaimAllMissions") end)
-    pcall(function() Request:InvokeServer("ClaimDaily") end)
-    pcall(function() Request:InvokeServer("ClaimAllMilestones") end)
-    pcall(function() Request:InvokeServer("BattlePassClaimAll") end)
-    pcall(function() Request:InvokeServer("HollowLoginClaim") end)
-    pcall(function() Request:InvokeServer("ClaimSkipGift") end)
-    pcall(function() Request:InvokeServer("JoinGiftClaim") end)
+    local ok, err = pcall(function()
+        local simple = {
+            "ClaimAllMissions", "ClaimDaily", "ClaimAllMilestones", "BattlePassClaimAll",
+            "HollowLoginClaim", "ClaimSkipGift", "JoinGiftClaim"
+        }
+        for _, name in ipairs(simple) do
+            if not alive() then return end
+            call(name)
+            task.wait(0.1)
+        end
 
-    if Goals then
-        if Goals.AchievementGroups then
-            for _, grp in ipairs(Goals.AchievementGroups) do
-                pcall(function()
-                    Request:InvokeServer("ClaimAchievementGroup", grp.Id)
-                    if grp.ChestGoal and grp.ChestGoal.Id then
-                        Request:InvokeServer("ClaimAchievement", grp.ChestGoal.Id)
+        if Goals then
+            if type(Goals.AchievementGroups) == "table" then
+                for _, grp in ipairs(Goals.AchievementGroups) do
+                    if not alive() then return end
+                    if type(grp) == "table" and grp.Id ~= nil then
+                        call("ClaimAchievementGroup", grp.Id)
+                        if type(grp.ChestGoal) == "table" and grp.ChestGoal.Id ~= nil then
+                            call("ClaimAchievement", grp.ChestGoal.Id)
+                        end
+                        task.wait(0.05)
                     end
-                end)
+                end
+            end
+            if type(Goals.Achievements) == "table" then
+                for _, ach in ipairs(Goals.Achievements) do
+                    if not alive() then return end
+                    if type(ach) == "table" and ach.Id ~= nil then
+                        call("ClaimAchievement", ach.Id)
+                        task.wait(0.05)
+                    end
+                end
             end
         end
-        if Goals.Achievements then
-            for _, ach in ipairs(Goals.Achievements) do
-                pcall(function() Request:InvokeServer("ClaimAchievement", ach.Id) end)
-            end
-        end
-    end
-    notify("Auto Claim", "กดรับของรางวัลทั้งหมดเรียบร้อย!", 2)
-end
+    end)
 
-local function setAutoClaimLoop(enabled)
-    isAutoClaimLoop = enabled
-    if loopClaimBtn then
-        if isAutoClaimLoop then
-            loopClaimBtn.Text = "⏳ วนลูป Auto Claim: [ เปิด ]"
-            loopClaimBtn.BackgroundColor3 = Color3.fromRGB(46, 204, 113)
-        else
-            loopClaimBtn.Text = "⏳ วนลูป Auto Claim: [ ปิด ]"
-            loopClaimBtn.BackgroundColor3 = Color3.fromRGB(45, 42, 55)
-        end
+    claimBusy = false
+    if not ok then
+        warn("[AutoClaim] " .. tostring(err))
+    end
+    if silent then
+        local t = os.date("*t")
+        setStatus(string.format("🎁 Auto Claim รอบล่าสุดเสร็จ %02d:%02d", t.hour, t.min))
+    else
+        notify("Auto Claim", "กดรับของรางวัลทั้งหมดเรียบร้อย!", 2)
     end
 end
 
--- เธรดสำหรับวนลูป Auto Claim เบื้องหลัง
-task.spawn(function()
-    while true do
-        if isAutoClaimLoop then
-            claimAllEverything()
-        end
-        task.wait(60)
-    end
-end)
-
 -- ==========================================
--- 2. ฟังก์ชัน AUTO REDEEM CODES
+-- 9. ฟังก์ชัน AUTO REDEEM CODES
 -- ==========================================
+local redeemBusy = false
 local function redeemAllCodes()
+    if redeemBusy then return end
+    redeemBusy = true
+
     local codeList = { "RELEASE", "SAKURA", "300CCU", "1KLIKES", "HUECOMUNDO", "2KLIKES", "800CCU", "3KLIKES" }
-    if Config and Config.Codes then
+    if Config and type(Config.Codes) == "table" then
         for code, _ in pairs(Config.Codes) do
-            if not table.find(codeList, code) then
+            if type(code) == "string" and not table.find(codeList, code) then
                 table.insert(codeList, code)
             end
         end
     end
 
     local successCount = 0
-    for _, code in ipairs(codeList) do
-        local ok, res = pcall(function() return Request:InvokeServer("Redeem", code) end)
-        if ok and res and res.Ok then
+    for i, code in ipairs(codeList) do
+        if not alive() then break end
+        setStatus(string.format("🏷️ ใส่โค้ด %d/%d: %s", i, #codeList, code))
+        local ok, res = call("Redeem", code)
+        if ok and type(res) == "table" and res.Ok then
             successCount = successCount + 1
         end
         task.wait(0.35)
     end
-    notify("Auto Redeem", "ใส่โค้ดทั้งหมดเสร็จสิ้น (สำเร็จ " .. successCount .. " โค้ด)", 3)
+
+    redeemBusy = false
+    notify("Auto Redeem", "ใส่โค้ดเสร็จ (สำเร็จ " .. successCount .. " โค้ด)", 3)
 end
 
 -- ==========================================
--- 3. ฟังก์ชัน ใช้น้ำยา LUCK (1 ขวด)
+-- 10. ฟังก์ชัน ใช้น้ำยา LUCK (1 ขวด)
 -- ==========================================
 local function useOneLuckPotion()
-    local state = pcall(function() return Request:InvokeServer("GetState") end) and Request:InvokeServer("GetState") or nil
-    local items = (state and state.Items) or {}
+    local okState, st = call("GetState")
+    local items = (okState and type(st) == "table" and type(st.Items) == "table") and st.Items or {}
 
     local potionToUse = "SuperLuck"
-    if (items["SuperLuck"] or 0) > 0 then
+    if (tonumber(items["SuperLuck"]) or 0) > 0 then
         potionToUse = "SuperLuck"
-    elseif (items["UltraLuck"] or 0) > 0 then
+    elseif (tonumber(items["UltraLuck"]) or 0) > 0 then
         potionToUse = "UltraLuck"
     end
 
-    local ok, res = pcall(function()
-        return Request:InvokeServer("UseLuck", potionToUse)
-    end)
-
-    if ok and res and res.Ok then
-        notify("🧪 Luck Potion", "กดใช้ " .. potionToUse .. " สำเร็จ! (เพิ่มเรทการสุ่มแล้ว)", 4)
+    local ok, res = call("UseLuck", potionToUse)
+    if ok and type(res) == "table" and res.Ok then
+        notify("🧪 Luck Potion", "ใช้ " .. potionToUse .. " สำเร็จ!", 4)
     else
-        local errMsg = (res and res.Error) or "ไม่มีน้ำยาในตัว หรือน้ำยายังออกฤทธิ์อยู่"
-        notify("🧪 Luck Potion", errMsg, 3)
+        local errMsg = (type(res) == "table" and res.Error) or (res == "timeout" and "เซิร์ฟไม่ตอบ") or "ไม่มีน้ำยา หรือน้ำยายังออกฤทธิ์อยู่"
+        notify("🧪 Luck Potion", tostring(errMsg), 3)
     end
 end
 
 -- ==========================================
--- 4. ฟังก์ชัน AUTO SUMMON (ข้ามอนิเมชัน 100%)
+-- 11. ฟังก์ชัน AUTO SUMMON (ข้ามอนิเมชัน)
 -- ==========================================
 local function setAutoSellSettings()
-    pcall(function()
-        if autoSellRare then Request:InvokeServer("SetAutoSell", "Rare", true) end
-        if autoSellEpic then Request:InvokeServer("SetAutoSell", "Epic", true) end
-    end)
+    if G.autoSellRare then call("SetAutoSell", "Rare", true) end
+    if G.autoSellEpic then call("SetAutoSell", "Epic", true) end
 end
 
 local function stopAutoSummon()
-    isAutoSummoning = false
-    updateSummonUI(false)
+    state.summonToken = nil
+    refreshSummonToggle()
     notify("Auto Summon", "หยุดการสุ่มแล้ว", 2)
 end
 
 local function startAutoSummonLoop()
-    if isAutoSummoning then return end
-    isAutoSummoning = true
-    updateSummonUI(true)
-    setAutoSellSettings()
+    if state.summonToken then
+        return
+    end
+    -- ใช้ token แยกแต่ละรอบ: กดปิดแล้วเปิดเร็วๆ จะไม่เกิดลูปสุ่มสองตัวซ้อนกัน
+    local token = {}
+    state.summonToken = token
+    refreshSummonToggle()
 
     task.spawn(function()
-        notify("Auto Summon", "เริ่มการสุ่มแบบข้ามอนิเมชัน...", 2)
+        setAutoSellSettings()
+        notify("Auto Summon", "เริ่มสุ่มแบบข้ามอนิเมชัน...", 2)
+        local rounds = 0
 
-        while isAutoSummoning do
-            local ok, res = pcall(function()
-                return Request:InvokeServer("Summon", 10)
-            end)
-
-            if ok and res then
-                if res.Ok and res.Results then
-                    local gotHighRarity = false
-                    for _, unit in ipairs(res.Results) do
-                        local name = unit.Unit or unit.Name or "Unknown"
-                        local rarity = unit.Rarity or "Unknown"
-
-                        if rarity == "Mythic" or rarity == "Secret" then
-                            gotHighRarity = true
-                            notify("🎉 ยินดีด้วย!", string.format("ได้ [%s] %s!", rarity, name), 5)
-                            print(string.format("[AutoSummon] ได้รับระดับสูง: %s (%s)", name, rarity))
-                        end
-                    end
-
-                    if gotHighRarity and stopOnMythicOrSecret then
-                        notify("Auto Summon", "หยุดสุ่มเนื่องจากได้ตัวละครระดับสูง!", 4)
-                        break
-                    end
-                else
-                    local errMsg = (res and res.Error) or "เพชรหมดหรือช่องเก็บเต็ม"
-                    notify("Auto Summon หยุดทำงาน", errMsg, 3)
-                    break
-                end
-            else
-                notify("Auto Summon", "การเชื่อมต่อขัดข้อง", 3)
+        while state.summonToken == token and alive() do
+            local ok, res = call("Summon", 10)
+            if state.summonToken ~= token then
+                break
+            end
+            if not ok then
+                notify("Auto Summon", "การเชื่อมต่อขัดข้อง (" .. tostring(res) .. ")", 3)
+                break
+            end
+            if type(res) ~= "table" or not res.Ok or type(res.Results) ~= "table" then
+                local errMsg = (type(res) == "table" and res.Error) or "เพชรหมดหรือช่องเก็บเต็ม"
+                notify("Auto Summon หยุดทำงาน", tostring(errMsg), 3)
                 break
             end
 
+            rounds = rounds + 1
+            local gotHighRarity = false
+            for _, unit in ipairs(res.Results) do
+                if type(unit) == "table" then
+                    local rarity = unit.Rarity or "Unknown"
+                    if rarity == "Mythic" or rarity == "Secret" then
+                        gotHighRarity = true
+                        local name = unit.Unit or unit.Name or "Unknown"
+                        notify("🎉 ยินดีด้วย!", string.format("ได้ [%s] %s!", tostring(rarity), tostring(name)), 5)
+                        print(string.format("[AutoSummon] ได้รับระดับสูง: %s (%s)", tostring(name), tostring(rarity)))
+                    end
+                end
+            end
+            setStatus("🎰 สุ่มไปแล้ว " .. rounds .. " รอบ (10x)")
+
+            if gotHighRarity and G.stopOnMythicOrSecret then
+                notify("Auto Summon", "หยุดสุ่มเพราะได้ตัวละครระดับสูง!", 4)
+                break
+            end
             task.wait(0.5)
         end
 
-        isAutoSummoning = false
-        updateSummonUI(false)
+        if state.summonToken == token then
+            state.summonToken = nil
+        end
+        refreshSummonToggle()
     end)
 end
 
 -- ==========================================
--- 5. ระบบ MERCHANT (ร้านค้าเร้นลับ - Rare Goods)
+-- 12. ระบบ MERCHANT (ร้านค้าเร้นลับ - Rare Goods)
 -- ==========================================
 local function fetchMerchantInfo()
-    local ok, res = pcall(function()
-        return Request:InvokeServer("MerchantInfo")
-    end)
-    if ok and res then
+    local ok, res = call("MerchantInfo")
+    if ok and type(res) == "table" then
         cachedMerchantInfo = res
         return res
     end
@@ -551,8 +757,8 @@ local function fetchMerchantInfo()
 end
 
 local function getLeftStock(offer, boughtTable)
-    local limit = offer.Limit or 1
-    local b = boughtTable and boughtTable[offer.Key]
+    local limit = tonumber(offer.Limit) or 1
+    local b = type(boughtTable) == "table" and boughtTable[offer.Key] or nil
     local boughtCount = 0
     if b == true then
         boughtCount = limit
@@ -563,7 +769,7 @@ local function getLeftStock(offer, boughtTable)
 end
 
 local function shouldAutoBuyMerchantItem(offer)
-    local item = offer.Item or ""
+    local item = tostring(offer.Item or "")
     local currency = offer.Currency or "Gold"
 
     if merchantConfig.buyAllGold and currency == "Gold" then return true end
@@ -578,282 +784,333 @@ local function shouldAutoBuyMerchantItem(offer)
 end
 
 local function buySingleMerchantItem(key, amount)
-    local ok, res = pcall(function()
-        return Request:InvokeServer("MerchantBuy", key, amount or 1)
-    end)
-    if ok and res and res.Ok then
+    local ok, res = call("MerchantBuy", key, amount or 1)
+    if ok and type(res) == "table" and res.Ok then
         return true
     end
-    local reason = (res and (res.Reason or res.Error)) or "เงินไม่พอ หรือสินค้าหมด"
-    return false, reason
+    local reason = (type(res) == "table" and (res.Reason or res.Error)) or (res == "timeout" and "เซิร์ฟไม่ตอบ") or "เงินไม่พอ หรือสินค้าหมด"
+    return false, tostring(reason)
+end
+
+-- ล็อกร้านค้า: กันลูป Auto Buy กับปุ่มกดมือทำงานพร้อมกันจนซื้อซ้ำ
+local shopLock = false
+local function withShopLock(fn)
+    local t0 = os.clock()
+    while shopLock and os.clock() - t0 < 30 do
+        task.wait(0.2)
+    end
+    shopLock = true
+    local ok, res = pcall(fn)
+    shopLock = false
+    if not ok then
+        warn("[AAH:Shop] " .. tostring(res))
+        return 0
+    end
+    return res or 0
+end
+
+local function calcQty(left, price, wallet)
+    price = tonumber(price) or 0
+    if price <= 0 then
+        return left
+    end
+    if wallet < price then
+        return 0
+    end
+    return math.min(left, math.floor(wallet / price))
 end
 
 local function runMerchantAutoBuy(isSilent)
-    local info = fetchMerchantInfo()
-    if not info or not info.Stock then
-        if not isSilent then notify("🛒 Merchant", "ไม่สามารถดึงข้อมูลร้านค้าได้", 3) end
-        return 0
-    end
+    return withShopLock(function()
+        local info = fetchMerchantInfo()
+        if not info or type(info.Stock) ~= "table" then
+            if not isSilent then notify("🛒 Merchant", "ดึงข้อมูลร้านค้าไม่ได้", 3) end
+            return 0
+        end
 
-    local stateOk, state = pcall(function() return Request:InvokeServer("GetState") end)
-    local gold = (stateOk and state and state.Gold) or 0
-    local gems = (stateOk and state and (state.Gems or state.Gem)) or 0
+        local stateOk, st = call("GetState")
+        local gold = (stateOk and type(st) == "table" and tonumber(st.Gold)) or 0
+        local gems = (stateOk and type(st) == "table" and tonumber(st.Gems or st.Gem)) or 0
 
-    local boughtCount = 0
-    local boughtList = {}
+        local boughtCount = 0
+        local boughtList = {}
 
-    for _, offer in ipairs(info.Stock) do
-        local left = getLeftStock(offer, info.Bought)
-        if left > 0 and shouldAutoBuyMerchantItem(offer) then
-            local price = offer.Price or 0
-            local cur = offer.Currency or "Gold"
+        for _, offer in ipairs(info.Stock) do
+            if not alive() then break end
+            if type(offer) == "table" then
+                local left = getLeftStock(offer, info.Bought)
+                if left > 0 and shouldAutoBuyMerchantItem(offer) then
+                    local price = tonumber(offer.Price) or 0
+                    local cur = offer.Currency or "Gold"
+                    local qty = calcQty(left, price, (cur == "Gold") and gold or gems)
 
-            local canBuyQty = 0
-            if cur == "Gold" and gold >= price then
-                canBuyQty = math.min(left, math.floor(gold / price))
-            elseif cur ~= "Gold" and gems >= price then
-                canBuyQty = math.min(left, math.floor(gems / price))
-            end
-
-            if canBuyQty > 0 then
-                local success = buySingleMerchantItem(offer.Key, canBuyQty)
-                if success then
-                    boughtCount = boughtCount + 1
-                    local cost = price * canBuyQty
-                    if cur == "Gold" then gold = gold - cost else gems = gems - cost end
-                    table.insert(boughtList, string.format("%s (x%d)", offer.Item, (offer.Amount or 1) * canBuyQty))
-                    print(string.format("[Merchant AutoBuy] ซื้อ %s x%d สำเร็จ (ใช้ %d %s)", offer.Item, canBuyQty, cost, cur))
+                    if qty > 0 then
+                        local success = buySingleMerchantItem(offer.Key, qty)
+                        if success then
+                            boughtCount = boughtCount + 1
+                            local cost = price * qty
+                            if cur == "Gold" then gold = gold - cost else gems = gems - cost end
+                            table.insert(boughtList, string.format("%s (x%s)", tostring(offer.Item), tostring((tonumber(offer.Amount) or 1) * qty)))
+                            print(string.format("[Merchant AutoBuy] ซื้อ %s x%s สำเร็จ (ใช้ %s %s)", tostring(offer.Item), tostring(qty), tostring(cost), tostring(cur)))
+                        end
+                        task.wait(0.2)
+                    end
                 end
             end
         end
-    end
 
-    fetchMerchantInfo()
+        fetchMerchantInfo()
 
-    if boughtCount > 0 then
-        notify("🛒 Merchant ซื้อสำเร็จ!", "ซื้อ " .. table.concat(boughtList, ", "), 4)
-    elseif not isSilent then
-        notify("🛒 Merchant", "ไม่มีไอเทมที่เลือก หรือเงินไม่เพียงพอ", 3)
-    end
-
-    return boughtCount
+        if boughtCount > 0 then
+            notify("🛒 Merchant ซื้อสำเร็จ!", "ซื้อ " .. table.concat(boughtList, ", "), 4)
+        elseif not isSilent then
+            notify("🛒 Merchant", "ไม่มีไอเทมที่เลือก หรือเงินไม่พอ", 3)
+        end
+        return boughtCount
+    end)
 end
 
 -- ==========================================
--- 6. ระบบ CURRENCY SHOP (Gold Shop & Gem Shop)
+-- 13. ระบบ CURRENCY SHOP (Gold Shop & Gem Shop)
 -- ==========================================
-local function getCurrencyShopLeft(offer, state)
-    local shop = (state and state.Shop) or {}
+local function getActiveColors()
+    if Config and type(Config.ShopColorsNow) == "function" then
+        local ok, res = pcall(Config.ShopColorsNow)
+        if ok and type(res) == "table" then
+            return res
+        end
+    end
+    return {}
+end
+
+local function getCurrencyShopLeft(offer, st)
+    local shop = (type(st) == "table" and type(st.Shop) == "table") and st.Shop or {}
     local currentHour = math.floor(getServerTime() / 3600)
     local bought = 0
-    if shop.Hour == currentHour and shop.Bought then
-        bought = shop.Bought[offer.Key] or 0
+    if shop.Hour == currentHour and type(shop.Bought) == "table" then
+        bought = tonumber(shop.Bought[offer.Key]) or 0
     end
     return math.max((offer.Stock or 1) - bought, 0)
 end
 
 local function buyCurrencyShopItem(offer, amount)
     local unit = nil
-    if offer.Rarity and Config and Config.ShopUnit then
+    if offer.Rarity and Config and type(Config.ShopUnit) == "function" then
         pcall(function() unit = Config.ShopUnit(offer) end)
     end
-    local ok, res = pcall(function()
-        return Request:InvokeServer("ShopBuy", offer.Key, amount or 1, unit)
-    end)
-    if ok and res and res.Ok then
+    local ok, res = call("ShopBuy", offer.Key, amount or 1, unit)
+    if ok and type(res) == "table" and res.Ok then
         return true
     end
-    local reason = (res and (res.Reason or res.Error)) or "เงินไม่พอ หรือสินค้าหมด"
-    return false, reason
+    local reason = (type(res) == "table" and (res.Reason or res.Error)) or (res == "timeout" and "เซิร์ฟไม่ตอบ") or "เงินไม่พอ หรือสินค้าหมด"
+    return false, tostring(reason)
+end
+
+local function shouldBuyCurrencyOffer(offer)
+    if offer.Currency == "Gold" and currencyShopConfig.buyAllGold then return true end
+    if offer.Key == "g_scroll" and currencyShopConfig.buyScroll then return true end
+    if offer.Key == "g_trait" and currencyShopConfig.buyTrait then return true end
+    if offer.Key == "g_shard" and currencyShopConfig.buyStar then return true end
+    if offer.Rotates and currencyShopConfig.buyRotatingGems then return true end
+    if offer.Rarity and currencyShopConfig.buyShards then return true end
+    return false
 end
 
 local function runCurrencyShopAutoBuy(isSilent)
-    local stateOk, state = pcall(function() return Request:InvokeServer("GetState") end)
-    if not stateOk or not state then
-        if not isSilent then notify("🪙 Currency Shop", "ไม่สามารถดึงข้อมูลสถานะได้", 3) end
-        return 0
-    end
-
-    local gold = state.Gold or 0
-    local gems = state.Gems or state.Gem or 0
-    local activeColors = (Config and Config.ShopColorsNow and Config.ShopColorsNow()) or {}
-
-    local boughtCount = 0
-    local boughtList = {}
-
-    local allOffers = {}
-    for _, item in ipairs(currencyShopDB.Gold) do table.insert(allOffers, item) end
-    for _, item in ipairs(currencyShopDB.Gems) do table.insert(allOffers, item) end
-
-    for _, offer in ipairs(allOffers) do
-        local isAvailable = true
-        if offer.Rotates then
-            isAvailable = (activeColors[offer.Item] == true)
+    return withShopLock(function()
+        local stateOk, st = call("GetState")
+        if not stateOk or type(st) ~= "table" then
+            if not isSilent then notify("🪙 Currency Shop", "ดึงข้อมูลสถานะไม่ได้", 3) end
+            return 0
         end
 
-        if isAvailable then
-            local left = getCurrencyShopLeft(offer, state)
-            local shouldBuy = false
+        local gold = tonumber(st.Gold) or 0
+        local gems = tonumber(st.Gems or st.Gem) or 0
+        local activeColors = getActiveColors()
 
-            if offer.Currency == "Gold" and currencyShopConfig.buyAllGold then
-                shouldBuy = true
-            elseif offer.Key == "g_scroll" and currencyShopConfig.buyScroll then
-                shouldBuy = true
-            elseif offer.Key == "g_trait" and currencyShopConfig.buyTrait then
-                shouldBuy = true
-            elseif offer.Key == "g_shard" and currencyShopConfig.buyStar then
-                shouldBuy = true
-            elseif offer.Rotates and currencyShopConfig.buyRotatingGems then
-                shouldBuy = true
-            elseif offer.Rarity and currencyShopConfig.buyShards then
-                shouldBuy = true
-            end
+        local boughtCount = 0
+        local boughtList = {}
 
-            if shouldBuy and left > 0 then
-                local price = offer.Price or 0
-                local cur = offer.Currency or "Gold"
-                local canBuyQty = 0
+        local allOffers = {}
+        for _, item in ipairs(currencyShopDB.Gold) do table.insert(allOffers, item) end
+        for _, item in ipairs(currencyShopDB.Gems) do table.insert(allOffers, item) end
 
-                if cur == "Gold" and gold >= price then
-                    canBuyQty = math.min(left, math.floor(gold / price))
-                elseif cur ~= "Gold" and gems >= price then
-                    canBuyQty = math.min(left, math.floor(gems / price))
+        for _, offer in ipairs(allOffers) do
+            if not alive() then break end
+            local isAvailable = (not offer.Rotates) or (activeColors[offer.Item] == true)
+            if isAvailable and shouldBuyCurrencyOffer(offer) then
+                local left = getCurrencyShopLeft(offer, st)
+                if left > 0 then
+                    local price = offer.Price or 0
+                    local cur = offer.Currency or "Gold"
+                    local qty = calcQty(left, price, (cur == "Gold") and gold or gems)
+
+                    if qty > 0 then
+                        local success = buyCurrencyShopItem(offer, qty)
+                        if success then
+                            boughtCount = boughtCount + 1
+                            local cost = price * qty
+                            if cur == "Gold" then gold = gold - cost else gems = gems - cost end
+                            table.insert(boughtList, string.format("%s (x%s)", tostring(offer.Name or offer.Item), tostring(qty)))
+                            print(string.format("[CurrencyShop AutoBuy] ซื้อ %s x%s สำเร็จ (ใช้ %s %s)", tostring(offer.Item), tostring(qty), tostring(cost), tostring(cur)))
+                        end
+                        task.wait(0.2)
+                    end
                 end
+            end
+        end
 
-                if canBuyQty > 0 then
-                    local success = buyCurrencyShopItem(offer, canBuyQty)
-                    if success then
-                        boughtCount = boughtCount + 1
-                        local cost = price * canBuyQty
-                        if cur == "Gold" then gold = gold - cost else gems = gems - cost end
-                        table.insert(boughtList, string.format("%s (x%d)", offer.Name or offer.Item, canBuyQty))
-                        print(string.format("[CurrencyShop AutoBuy] ซื้อ %s x%d สำเร็จ (ใช้ %d %s)", offer.Item, canBuyQty, cost, cur))
+        if boughtCount > 0 then
+            notify("🪙 Currency Shop ซื้อสำเร็จ!", "ซื้อ " .. table.concat(boughtList, ", "), 4)
+        elseif not isSilent then
+            notify("🪙 Currency Shop", "ไม่มีไอเทมที่เลือก หรือเงินไม่พอ", 3)
+        end
+        return boughtCount
+    end)
+end
+
+-- ==========================================
+-- 14. ตัวช่วยกดปุ่ม GUI ของเกม (รองรับหลาย executor)
+-- ==========================================
+
+-- เช็คว่าปุ่มแสดงอยู่จริงบนจอ (ตัวเองและพ่อทุกชั้น Visible และ ScreenGui Enabled)
+local function isShown(obj)
+    local cur = obj
+    while cur do
+        if cur:IsA("GuiObject") then
+            if not cur.Visible then
+                return false
+            end
+        elseif cur:IsA("LayerCollector") then
+            return cur.Enabled and obj.AbsoluteSize.X > 1 and obj.AbsoluteSize.Y > 1
+        end
+        cur = cur.Parent
+    end
+    return false
+end
+
+-- อ่านข้อความบนปุ่ม (ถ้าเป็น ImageButton จะอ่านจาก TextLabel ข้างใน) และตัด rich text ออก
+local function buttonText(btn)
+    local txt = ""
+    if btn:IsA("TextButton") then
+        txt = btn.Text or ""
+    end
+    if txt == "" then
+        local lbl = btn:FindFirstChildWhichIsA("TextLabel", true)
+        if lbl then
+            txt = lbl.Text or ""
+        end
+    end
+    txt = string.gsub(txt, "<[^>]->", "")
+    return string.lower(txt)
+end
+
+-- กดปุ่มของเกม: ลอง getconnections ก่อน (แม่นสุด) แล้ว firesignal แล้วจำลองการแตะจอ
+local function pressButton(btn)
+    local checkedConnections = false
+
+    if type(getconnections) == "function" then
+        for _, sigName in ipairs({ "Activated", "MouseButton1Click", "MouseButton1Down" }) do
+            local okSig, sig = pcall(function() return btn[sigName] end)
+            if okSig and sig then
+                local okC, conns = pcall(getconnections, sig)
+                if okC and type(conns) == "table" then
+                    checkedConnections = true
+                    if #conns > 0 then
+                        local fired = false
+                        for _, c in ipairs(conns) do
+                            local okF = pcall(function() c:Fire() end)
+                            if not okF then
+                                okF = pcall(function() c.Function() end)
+                            end
+                            if okF then
+                                fired = true
+                            end
+                        end
+                        if fired then
+                            return true
+                        end
                     end
                 end
             end
         end
     end
 
-    if boughtCount > 0 then
-        notify("🪙 Currency Shop ซื้อสำเร็จ!", "ซื้อ " .. table.concat(boughtList, ", "), 4)
-    elseif not isSilent then
-        notify("🪙 Currency Shop", "ไม่มีไอเทมที่เลือก หรือเงินไม่เพียงพอ", 3)
-    end
-
-    return boughtCount
-end
-
-local function setAutoShopLoop(enabled)
-    isAutoShopLoop = enabled
-    if loopShopBtn then
-        if isAutoShopLoop then
-            loopShopBtn.Text = "⏳ วนลูป Auto Buy ทุกร้าน: [ เปิด ]"
-            loopShopBtn.BackgroundColor3 = Color3.fromRGB(46, 204, 113)
-        else
-            loopShopBtn.Text = "⏳ วนลูป Auto Buy ทุกร้าน: [ ปิด ]"
-            loopShopBtn.BackgroundColor3 = Color3.fromRGB(45, 42, 55)
+    -- ถ้า getconnections ใช้ได้แต่ปุ่มไม่มี connection เลย firesignal ก็จะไม่มีผล จึงข้ามไปจำลองการแตะ
+    if not checkedConnections and type(firesignal) == "function" then
+        local ok = pcall(firesignal, btn.Activated)
+        if ok then
+            return true
         end
     end
+
+    if VIM and isShown(btn) then
+        local ok = pcall(function()
+            local pos = btn.AbsolutePosition + btn.AbsoluteSize / 2
+            local sg = btn:FindFirstAncestorWhichIsA("ScreenGui")
+            local inset = GuiService:GetGuiInset()
+            local y = pos.Y + ((sg and not sg.IgnoreGuiInset) and inset.Y or 0)
+            VIM:SendMouseButtonEvent(pos.X, y, 0, true, game, 0)
+            task.wait(0.05)
+            VIM:SendMouseButtonEvent(pos.X, y, 0, false, game, 0)
+        end)
+        return ok
+    end
+    return false
 end
 
--- เธรดสำหรับวนลูป Auto Buy ทุกร้านค้าเบื้องหลัง
-task.spawn(function()
-    while true do
-        if isAutoShopLoop then
-            runMerchantAutoBuy(true)
-            runCurrencyShopAutoBuy(true)
-        end
-        for _ = 1, 30 do
-            task.wait(1)
-        end
+local function getPlayerGuiScreen(name)
+    local pGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local gui = pGui and pGui:FindFirstChild(name)
+    if gui and gui:IsA("LayerCollector") and gui.Enabled then
+        return gui
     end
-end)
-
--- สลับการเปิด/ปิดวนลูป Auto Buy ทั้งสองร้าน
-local function toggleAllShopLoop()
-    setAutoShopLoop(not isAutoShopLoop)
-    queueSave()
-    if isAutoShopLoop then
-        notify("🛒 Auto Buy ร้านค้า", "เปิดระบบซื้ออัตโนมัติทั้ง Merchant และ Currency Shop!", 3)
-    else
-        notify("🛒 Auto Buy ร้านค้า", "ปิดระบบซื้ออัตโนมัติแล้ว", 2)
-    end
-end
-
--- ==========================================
--- 7. ระบบ AUTO PLAY & AUTO FARM ขั้นสูง
--- ==========================================
-
--- ส่งการตั้งค่า Battle Settings ไปยังเซิร์ฟเวอร์
-local function applyServerBattleSettings()
-    local cfg = _G.AnimeAshura_AutoFarm
-
-    if cfg.AutoSkills then
-        pcall(function() Request:InvokeServer("TeamAuto", true) end)
-    end
-
-    if cfg.AutoReplay then
-        pcall(function()
-            Request:InvokeServer("BattleSetting", "AutoReplay", true)
-            Request:InvokeServer("BattleSetting", "AutoNext", false)
-        end)
-    elseif cfg.AutoNext then
-        pcall(function()
-            Request:InvokeServer("BattleSetting", "AutoNext", true)
-            Request:InvokeServer("BattleSetting", "AutoReplay", false)
-        end)
-    end
-
-    if cfg.LowGraphics then
-        pcall(function()
-            Request:InvokeServer("BattleSetting", "LowDetail", true)
-            Request:InvokeServer("BattleSetting", "NoVfx", true)
-            Request:InvokeServer("BattleSetting", "NoNumbers", true)
-        end)
-    end
+    return nil
 end
 
 -- ฟังก์ชันตรวจสอบว่าตัวละครอยู่ในห้องหรือยัง (ผ่าน UI ของเกม)
 local function isInRoom()
-    local pGui = LocalPlayer:FindFirstChild("PlayerGui")
-    if not pGui then return false end
-    local playMenu = pGui:FindFirstChild("PlayMenu")
-    if playMenu and playMenu.Enabled then return true end
-    local readyRoom = pGui:FindFirstChild("ReadyRoom")
-    if readyRoom and readyRoom.Enabled then return true end
-    return false
+    return getPlayerGuiScreen("PlayMenu") ~= nil or getPlayerGuiScreen("ReadyRoom") ~= nil
 end
 
--- ฟังก์ชันกดปุ่มบน GUI ของเกมโดยตรง (Native Click via firesignal)
+-- กดปุ่มบน GUI ของเกมตามข้อความ (เช่นปุ่ม Start บน PlayMenu)
 local function clickGuiButton(guiName, targetText)
-    local pGui = LocalPlayer:FindFirstChild("PlayerGui")
-    local gui = pGui and pGui:FindFirstChild(guiName)
-    if not gui or not gui.Enabled then return false end
-
+    local gui = getPlayerGuiScreen(guiName)
+    if not gui then
+        return false
+    end
     targetText = string.lower(targetText)
-    for _, desc in ipairs(gui:GetDescendants()) do
-        if desc:IsA("TextButton") or desc:IsA("ImageButton") or desc:IsA("GuiButton") then
-            local textMatch = false
-            if desc:IsA("TextButton") and string.find(string.lower(desc.Text), targetText) then
-                textMatch = true
-            else
-                local lbl = desc:FindFirstChildWhichIsA("TextLabel", true)
-                if lbl and string.find(string.lower(lbl.Text), targetText) then
-                    textMatch = true
-                end
-            end
-
-            if textMatch and desc.Visible then
-                pcall(function()
-                    if firesignal then
-                        firesignal(desc.Activated)
-                    end
-                end)
-                return true
+    for _, d in ipairs(gui:GetDescendants()) do
+        if d:IsA("GuiButton") and d.Visible then
+            if string.find(buttonText(d), targetText, 1, true) then
+                return pressButton(d)
             end
         end
     end
     return false
+end
+
+-- ==========================================
+-- 15. ระบบ AUTO PLAY & AUTO FARM ขั้นสูง
+-- ==========================================
+
+-- ส่งการตั้งค่า Battle Settings ไปยังเซิร์ฟเวอร์
+local function applyServerBattleSettings()
+    if farmCfg.AutoSkills then
+        call("TeamAuto", true)
+    end
+    if farmCfg.AutoReplay then
+        call("BattleSetting", "AutoReplay", true)
+        call("BattleSetting", "AutoNext", false)
+    elseif farmCfg.AutoNext then
+        call("BattleSetting", "AutoNext", true)
+        call("BattleSetting", "AutoReplay", false)
+    end
+    if farmCfg.LowGraphics then
+        call("BattleSetting", "LowDetail", true)
+        call("BattleSetting", "NoVfx", true)
+        call("BattleSetting", "NoNumbers", true)
+    end
 end
 
 -- ค้นหาห้องว่างใน Lobby ตามโหมดที่เลือก (ครอบคลุมทุกโหมด)
@@ -866,7 +1123,6 @@ local function findPlayRoom(targetMode)
         local rMode = r:GetAttribute("Mode") or "Story"
         local mem = r:GetAttribute("Members") or 0
         local zone = r:FindFirstChild("Zone")
-
         if zone and rMode == targetMode and mem == 0 then
             return r, zone
         end
@@ -885,12 +1141,7 @@ local function findPlayRoom(targetMode)
     local lobby = workspace:FindFirstChild("Lobby")
     local areas = lobby and lobby:FindFirstChild("Areas")
     if areas then
-        local areaMap = {
-            Story = "Play",
-            Raid = "Raid",
-            Castle = "Castle",
-            Challenge = "Challenge"
-        }
+        local areaMap = { Story = "Play", Raid = "Raid", Castle = "Castle", Challenge = "Challenge" }
         local areaName = areaMap[targetMode] or "Play"
         local area = areas:FindFirstChild(areaName) or areas:FindFirstChild("Play")
 
@@ -922,1517 +1173,1510 @@ local function findPlayRoom(targetMode)
     -- 4. Fallback: คืนห้องแรกที่มี Zone
     for _, r in ipairs(rooms) do
         local z = r:FindFirstChild("Zone")
-        if z then return r, z end
+        if z then
+            return r, z
+        end
     end
 
     return nil, nil
 end
 
--- วาร์ปตัวละครและกระตุ้นการเหยียบ Zone อย่างสมบูรณ์
-local function triggerZoneTouch(zone)
-    local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-    local hrp = char:WaitForChild("HumanoidRootPart", 5)
-    if hrp and zone then
-        -- ย้ายตำแหน่งตัวละครไปที่ Zone
-        hrp.CFrame = zone.CFrame + Vector3.new(0, 0.5, 0)
-        pcall(function() hrp.AssemblyLinearVelocity = Vector3.new(0, -5, 0) end)
-
-        -- กระตุ้น TouchInterest ทันทีถ้า executor รองรับ
-        pcall(function()
-            if firetouchinterest then
-                firetouchinterest(hrp, zone, 0)
-                task.wait(0.05)
-                firetouchinterest(hrp, zone, 1)
-            end
-        end)
-        return true
+-- รอ HumanoidRootPart แบบมี timeout (ไม่ค้างตลอดไปถ้าตัวละครยังไม่เกิด)
+local function getHRP(timeout)
+    local t0 = os.clock()
+    while alive() do
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            return hrp
+        end
+        if os.clock() - t0 > (timeout or 10) then
+            break
+        end
+        task.wait(0.2)
     end
-    return false
+    return nil
 end
 
--- ✨ ดำเนินการเข้าห้องและเริ่ม Auto Play แบบสมบูรณ์ 100%
-local isStartingRoom = false
-local function enterAndStartAutoPlay()
-    if isStartingRoom then return end
-    isStartingRoom = true
+-- วาร์ปตัวละครและกระตุ้นการเหยียบ Zone
+local function triggerZoneTouch(zone)
+    if not (zone and zone.Parent) then
+        return false
+    end
+    local part = zone
+    if not part:IsA("BasePart") then
+        part = (part:IsA("Model") and part.PrimaryPart) or part:FindFirstChildWhichIsA("BasePart", true)
+        if not part then
+            return false
+        end
+    end
+    local hrp = getHRP(8)
+    if not hrp then
+        return false
+    end
 
-    local cfg = _G.AnimeAshura_AutoFarm or {}
-    local mode = cfg.Mode or "Story"
-    local world = tonumber(cfg.World) or 1
-    local stage = tonumber(cfg.Stage) or 1
-    local difficulty = cfg.Difficulty or "Easy"
-    local isSolo = (cfg.Solo ~= false)
+    pcall(function()
+        hrp.CFrame = part.CFrame + Vector3.new(0, 0.5, 0)
+        hrp.AssemblyLinearVelocity = Vector3.new(0, -5, 0)
+    end)
+
+    -- กระตุ้น TouchInterest ทันทีถ้า executor รองรับ
+    if type(firetouchinterest) == "function" then
+        pcall(firetouchinterest, hrp, part, 0)
+        task.wait(0.05)
+        pcall(firetouchinterest, hrp, part, 1)
+    end
+    return true
+end
+
+-- ✨ ดำเนินการเข้าห้องและเริ่ม Auto Play
+local function enterAndStartAutoPlay(manual)
+    if IN_BATTLE then
+        if manual then notify("⚔️ Auto Play", "ตอนนี้อยู่ในด่านแล้ว ใช้ปุ่มนี้ได้เฉพาะใน Lobby", 3) end
+        return
+    end
+    if state.startingRoom then
+        if manual then setStatus("⏳ กำลังเข้าห้องอยู่แล้ว รอสักครู่...") end
+        return
+    end
+    if state.teleporting then
+        return
+    end
+    state.startingRoom = true
+    state.lastStartAttempt = os.clock()
 
     task.spawn(function()
-        notify("⚔️ Auto Play", string.format("🎯 เตรียมลุยด่าน [%s W%d S%d (%s)]...", mode, world, stage, difficulty), 3)
+        local ok, err = pcall(function()
+            sanitizeFarm()
+            local mode, world, stage, difficulty = farmCfg.Mode, farmCfg.World, farmCfg.Stage, farmCfg.Difficulty
+            setStatus(string.format("🎯 เตรียมลุย [%s W%s S%s %s]", mode, tostring(world), tostring(stage), difficulty))
 
-        -- 1. ปรับค่า Battle Settings (AutoSkills, AutoReplay, LowDetail)
-        applyServerBattleSettings()
+            -- 1. ปรับค่า Battle Settings (AutoSkills, AutoReplay, LowDetail)
+            applyServerBattleSettings()
 
-        -- 2. ตรวจสอบว่าเข้าห้องอยู่แล้วหรือยัง
-        if not isInRoom() then
-            -- ออกจากห้องเก่าก่อน (ถ้ามีค้าง)
-            pcall(function() Request:InvokeServer("LeaveRoom") end)
-            pcall(function() Request:InvokeServer("CancelRoom") end)
-            task.wait(0.3)
+            -- 2. ตรวจสอบว่าเข้าห้องอยู่แล้วหรือยัง
+            if not isInRoom() then
+                -- ออกจากห้องเก่าก่อน (ถ้ามีค้าง)
+                call("LeaveRoom")
+                call("CancelRoom")
+                if not sleep(0.3) then return end
 
-            -- ค้นหาห้องว่าง
-            local room, zone = findPlayRoom(mode)
-            if not zone then
-                notify("⚔️ Auto Play", "❌ ไม่พบแท่นเข้าห้องสำหรับ " .. mode, 4)
-                isStartingRoom = false
+                local _, zone = findPlayRoom(mode)
+                if not zone then
+                    notify("⚔️ Auto Play", "❌ ไม่พบแท่นเข้าห้องสำหรับ " .. mode, 4)
+                    return
+                end
+
+                setStatus("📍 วาร์ปไปที่แท่นห้อง...")
+                triggerZoneTouch(zone)
+
+                -- รอให้เซิร์ฟเวอร์ตอบรับการเข้าห้อง (PlayMenu หรือ ReadyRoom ปรากฏ)
+                local t0 = os.clock()
+                while alive() and not isInRoom() and os.clock() - t0 < 5 do
+                    task.wait(0.4)
+                    triggerZoneTouch(zone)
+                end
+                if not isInRoom() then
+                    setStatus("⚠️ เข้าห้องช้า กำลังลองส่งคำสั่งโดยตรง...")
+                end
+            end
+            if not alive() then return end
+
+            local stagePayload = {
+                Mode = mode,
+                World = world,
+                Stage = stage,
+                Difficulty = difficulty,
+                Tier = 1
+            }
+
+            -- 3. ส่งคำสั่งเลือกด่าน (RoomPick)
+            setStatus("⚙️ กำลังเลือกด่าน...")
+            call("RoomPick", stagePayload)
+            sleep(0.3)
+
+            -- 4. ล็อกเล่นคนเดียว (Solo)
+            if farmCfg.Solo then
+                call("RoomOpen", false)
+                sleep(0.2)
+            end
+
+            -- 5. ส่งคำสั่งพร้อม (ReadyRoom) และกดปุ่ม Start บน PlayMenu
+            setStatus("⏳ ส่งคำสั่งพร้อม (Ready)...")
+            local readyOk, readyRes = call("ReadyRoom", stagePayload)
+            clickGuiButton("PlayMenu", "start")
+            sleep(0.5)
+
+            if readyOk and type(readyRes) == "table" and readyRes.Ok == false and readyRes.Error then
+                notify("❌ พร้อมด่านนี้ไม่ได้", tostring(readyRes.Error), 5)
                 return
             end
 
-            -- วาร์ปเข้าสู่ Zone
-            notify("⚔️ Auto Play", "📍 วาร์ปไปที่แท่นห้อง...", 2)
-            triggerZoneTouch(zone)
-
-            -- รอให้เซิร์ฟเวอร์ตอบรับการเข้าห้อง (PlayMenu หรือ ReadyRoom ปรากฏ)
-            local waitTime = 0
-            while not isInRoom() and waitTime < 4 do
-                task.wait(0.3)
-                waitTime = waitTime + 0.3
-                local char = LocalPlayer.Character
-                local hrp = char and char:FindFirstChild("HumanoidRootPart")
-                if hrp and zone then
-                    hrp.CFrame = zone.CFrame + Vector3.new(math.random(-1, 1) * 0.1, 0.2, math.random(-1, 1) * 0.1)
-                end
-                triggerZoneTouch(zone)
+            -- 6. รอให้ ReadyRoom GUI เปิด
+            local t1 = os.clock()
+            while alive() and os.clock() - t1 < 2 do
+                if getPlayerGuiScreen("ReadyRoom") then break end
+                task.wait(0.2)
             end
 
-            if not isInRoom() then
-                notify("⚔️ Auto Play", "⚠️ เข้าห้องล่าช้า กำลังลองส่งคำสั่งโดยตรง...", 2)
+            -- 7. ส่งคำสั่งเริ่มด่าน (StartRoom) และ fallback แบบส่ง payload
+            setStatus("🚀 เริ่มด่าน (StartRoom)...")
+            local startOk, startRes = call("StartRoom")
+            if not startOk or (type(startRes) == "table" and startRes.Ok == false) then
+                startOk, startRes = call("StartRoom", stagePayload)
             end
-        end
+            clickGuiButton("ReadyRoom", "start")
 
-        local stagePayload = {
-            Mode = mode,
-            World = world,
-            Stage = stage,
-            Difficulty = difficulty,
-            Tier = 1
-        }
-
-        -- 3. ส่งคำสั่งเลือกด่าน (RoomPick)
-        notify("⚔️ Auto Play", "⚙️ กำลังเลือกด่าน...", 2)
-        pcall(function() Request:InvokeServer("RoomPick", stagePayload) end)
-        task.wait(0.25)
-
-        -- 4. ล็อกเล่นคนเดียว (Solo)
-        if isSolo then
-            pcall(function() Request:InvokeServer("RoomOpen", false) end)
-            task.wait(0.2)
-        end
-
-        -- 5. ส่งคำสั่งพร้อม (ReadyRoom) และกดปุ่ม Start บน PlayMenu
-        notify("⚔️ Auto Play", "⏳ ส่งคำสั่งพร้อม (Ready)...", 2)
-        local readyOk, readyRes = pcall(function()
-            return Request:InvokeServer("ReadyRoom", stagePayload)
+            if startOk and type(startRes) == "table" and startRes.Ok == false and startRes.Error then
+                notify("❌ เริ่มเกมไม่สำเร็จ", tostring(startRes.Error), 4)
+            else
+                notify("⚔️ Auto Play", "✅ ส่งคำสั่งเริ่มเกมแล้ว กำลังเข้าแมพ...", 3)
+            end
+            sleep(3)
         end)
 
-        -- จำลองการกดปุ่ม Start บน PlayMenu เผื่อเซิร์ฟเวอร์รอสัญญาณ UI
-        clickGuiButton("PlayMenu", "Start")
-        task.wait(0.5)
-
-        if readyOk and readyRes and readyRes.Ok == false and readyRes.Error then
-            notify("❌ ไม่สามารถพร้อมด่านนี้ได้", tostring(readyRes.Error), 5)
-            isStartingRoom = false
-            return
+        if not ok then
+            warn("[AutoPlay] " .. tostring(err))
+            notify("⚔️ Auto Play", "ผิดพลาด: " .. tostring(err), 4)
         end
-
-        -- 6. รอให้ ReadyRoom GUI เปิด
-        local rWait = 0
-        while rWait < 2 do
-            local pGui = LocalPlayer:FindFirstChild("PlayerGui")
-            local rr = pGui and pGui:FindFirstChild("ReadyRoom")
-            if rr and rr.Enabled then break end
-            task.wait(0.2)
-            rWait = rWait + 0.2
-        end
-
-        -- 7. ส่งคำสั่งเริ่มด่าน (StartRoom)
-        notify("⚔️ Auto Play", "🚀 เริ่มด่าน (StartRoom)...", 2)
-        local startOk, startRes = pcall(function()
-            return Request:InvokeServer("StartRoom")
-        end)
-
-        -- Fallback: ลองส่ง stagePayload ด้วย
-        if not startOk or (startRes and startRes.Ok == false) then
-            pcall(function()
-                return Request:InvokeServer("StartRoom", stagePayload)
-            end)
-        end
-
-        -- จำลองการกดปุ่ม Start บน ReadyRoom GUI ด้วย
-        clickGuiButton("ReadyRoom", "Start")
-
-        if startOk and startRes and startRes.Ok == false and startRes.Error then
-            notify("❌ เริ่มเกมไม่สำเร็จ", tostring(startRes.Error), 4)
-        else
-            notify("⚔️ Auto Play", "✅ ส่งคำสั่งเริ่มเกมเรียบร้อย! กำลังเข้าสู่แมพ...", 4)
-        end
-
-        task.wait(3)
-        isStartingRoom = false
+        state.startingRoom = false
     end)
 end
 
 local function leaveCurrentRoom()
-    pcall(function()
-        local res = Request:InvokeServer("LeaveRoom")
-        if res and res.Exit and LocalPlayer.Character then
-            LocalPlayer.Character:PivotTo(res.Exit)
+    local ok, res = call("LeaveRoom")
+    if ok and type(res) == "table" and typeof(res.Exit) == "CFrame" then
+        local char = LocalPlayer.Character
+        if char then
+            pcall(function() char:PivotTo(res.Exit) end)
         end
-    end)
-    pcall(function() Request:InvokeServer("CancelRoom") end)
+    end
+    call("CancelRoom")
     notify("⚔️ Auto Play", "ออกจากห้องเรียบร้อย", 2)
 end
 
 -- ==========================================
--- ✨ 7.5 ระบบ RESTOCK EXIT BATTLE (ออกด่านไปซื้อของแล้วกลับเล่นต่อ)
+-- 16. GUI สำหรับมือถือ
 -- ==========================================
--- ฟังก์ชันคำนวณเวลาที่เหลือก่อน restock
-local function getMerchantRestockRemaining()
-    local info = cachedMerchantInfo or fetchMerchantInfo()
-    if info and info.EndsAt then
-        return info.EndsAt - getServerTime()
-    end
-    return 10800  -- default 3 ชั่วโมง
-end
-
-local function getCurrencyShopRestockRemaining()
-    return 3600 - (getServerTime() % 3600)
-end
-
--- ฟังก์ชันหลักของ Restock Exit: ตรวจจับการรีเซ็ตและสั่งกลับ Lobby ไปซื้อ
-local function runRestockExitWatcher()
-    task.spawn(function()
-        -- ติดตาม "ชั่วโมง" ที่ซื้อล่าสุด เพื่อดูว่า restock ใหม่ยัง
-        local lastCurrencyHour = math.floor(getServerTime() / 3600)
-        local lastMerchantEndsAt = nil
-        pcall(function()
-            local info = fetchMerchantInfo()
-            if info and info.EndsAt then
-                lastMerchantEndsAt = info.EndsAt
-            end
-        end)
-
-        while true do
-            task.wait(5)
-
-            -- ไม่เปิดระบบ Restock Exit
-            if not restockExitBattle then continue end
-            -- ไม่ได้เปิด Auto Shop Loop
-            if not isAutoShopLoop then continue end
-            -- ไม่ได้อยู่ใน Battle Place
-            if game.PlaceId ~= 112575319532871 then
-                -- อยู่ใน Lobby: ถ้ามี pending restock ให้ซื้อของแล้วเข้าด่านใหม่
-                if _restockPending then
-                    _restockPending = false
-                    notify("🛒 Restock", "กลับมาที่ Lobby แล้ว! กำลังซื้อของ...", 3)
-                    task.wait(2)
-                    runMerchantAutoBuy(false)
-                    task.wait(0.5)
-                    runCurrencyShopAutoBuy(false)
-                    task.wait(1)
-                    -- กลับไปฟาร์มต่อ
-                    if _G.AnimeAshura_AutoFarm and _G.AnimeAshura_AutoFarm.Enabled then
-                        notify("⚔️ Auto Play", "ซื้อของเสร็จ! กำลังกลับเข้าด่านฟาร์มต่อ...", 3)
-                        task.wait(1)
-                        enterAndStartAutoPlay()
-                    end
-                end
-                continue
-            end
-
-            -- อยู่ใน Battle Place: ตรวจจับ restock
-            local now = getServerTime()
-            local currentHour = math.floor(now / 3600)
-
-            local currencyRestocked = (currentHour ~= lastCurrencyHour)
-            local merchantRestocked = false
-
-            if lastMerchantEndsAt and now >= lastMerchantEndsAt then
-                merchantRestocked = true
-            end
-
-            if currencyRestocked or merchantRestocked then
-                -- อัปเดตตัวจำ
-                lastCurrencyHour = currentHour
-                if merchantRestocked then
-                    lastMerchantEndsAt = (lastMerchantEndsAt or 0) + 10800
-                end
-
-                _restockPending = true
-                notify("🛒 Restock!", "ร้านค้ารีเซ็ตแล้ว! จะออกจากด่านเมื่อเล่นจบรอบนี้...", 5)
-
-                -- ปิด AutoReplay / AutoNext เพื่อให้ด่านจบแล้วกลับ Lobby
-                pcall(function()
-                    Request:InvokeServer("BattleSetting", "AutoReplay", false)
-                    Request:InvokeServer("BattleSetting", "AutoNext", false)
-                end)
-
-                -- รอจนกลับ Lobby (PlaceId เปลี่ยน)
-                local waitCount = 0
-                while game.PlaceId == 112575319532871 and waitCount < 300 do
-                    task.wait(2)
-                    waitCount = waitCount + 1
-
-                    -- กดปุ่ม Return to Lobby / Leave ถ้าเห็น
-                    pcall(function()
-                        local pGui = LocalPlayer:FindFirstChild("PlayerGui")
-                        if pGui then
-                            for _, g in ipairs(pGui:GetChildren()) do
-                                if g:IsA("ScreenGui") and g.Enabled then
-                                    for _, btn in ipairs(g:GetDescendants()) do
-                                        if btn:IsA("TextButton") and btn.Visible then
-                                            local txt = string.lower(btn.Text)
-                                            if string.find(txt, "lobby") or string.find(txt, "return") or string.find(txt, "leave") or string.find(txt, "exit") then
-                                                pcall(function() firesignal(btn.Activated) end)
-                                            end
-                                        end
-                                    end
-                                end
-                            end
-                        end
-                    end)
-                end
-
-                -- ถ้ารอนานเกินไป ลอง TeleportService กลับ Lobby
-                if game.PlaceId == 112575319532871 then
-                    pcall(function()
-                        game:GetService("TeleportService"):Teleport(81532592154280, LocalPlayer)
-                    end)
-                end
-            end
-        end
-    end)
-end
-
--- ==========================================
--- 8. GUI เมนูควบคุม (Draggable)
--- ==========================================
-local parentGui = (pcall(function() return game:GetService("CoreGui") end) and game:GetService("CoreGui")) or LocalPlayer:WaitForChild("PlayerGui")
-
-if parentGui:FindFirstChild("AnimeAshuraHub") then
-    parentGui.AnimeAshuraHub:Destroy()
-end
-
-local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "AnimeAshuraHub"
-screenGui.ResetOnSpawn = false
-screenGui.Parent = parentGui
-
--- ----------------- MAIN FRAME -----------------
-local mainFrame = Instance.new("Frame")
-mainFrame.Name = "MainFrame"
-mainFrame.Size = UDim2.fromOffset(260, 440)
-mainFrame.Position = UDim2.new(0.5, -310, 0.20, 0)
-mainFrame.BackgroundColor3 = Color3.fromRGB(20, 18, 25)
-mainFrame.BorderSizePixel = 0
-mainFrame.Active = true
-mainFrame.Draggable = true
-mainFrame.Parent = screenGui
-
-local corner = Instance.new("UICorner", mainFrame)
-corner.CornerRadius = UDim.new(0, 10)
-
-local stroke = Instance.new("UIStroke", mainFrame)
-stroke.Color = Color3.fromRGB(80, 75, 100)
-stroke.Thickness = 1.5
-
-local title = Instance.new("TextLabel", mainFrame)
-title.Size = UDim2.new(1, 0, 0, 38)
-title.BackgroundTransparency = 1
-title.Font = Enum.Font.GothamBold
-title.Text = "Anime Ashura Hub v2.0"
-title.TextColor3 = Color3.fromRGB(255, 120, 200)
-title.TextSize = 16
-
-local function createButton(name, text, pos, color, callback, parent)
-    local btn = Instance.new("TextButton", parent or mainFrame)
-    btn.Name = name
-    btn.Size = UDim2.new(1, -24, 0, 36)
-    btn.Position = pos
-    btn.BackgroundColor3 = color
-    btn.Font = Enum.Font.GothamSemibold
-    btn.Text = text
-    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    btn.TextSize = 13
-    btn.BorderSizePixel = 0
-    btn.AutoButtonColor = true
-
-    local btnCorner = Instance.new("UICorner", btn)
-    btnCorner.CornerRadius = UDim.new(0, 8)
-
-    btn.Activated:Connect(callback)
-    return btn
-end
-
--- ----------------- SHOP SUB-FRAME (MERCHANT & CURRENCY SHOP) -----------------
-shopFrame = Instance.new("Frame")
-shopFrame.Name = "ShopFrame"
-shopFrame.Size = UDim2.fromOffset(380, 480)
-shopFrame.Position = UDim2.new(0.5, -40, 0.18, 0)
-shopFrame.BackgroundColor3 = Color3.fromRGB(22, 20, 30)
-shopFrame.BorderSizePixel = 0
-shopFrame.Active = true
-shopFrame.Draggable = true
-shopFrame.Visible = false
-shopFrame.Parent = screenGui
-
-local sCorner = Instance.new("UICorner", shopFrame)
-sCorner.CornerRadius = UDim.new(0, 10)
-
-local sStroke = Instance.new("UIStroke", shopFrame)
-sStroke.Color = Color3.fromRGB(255, 170, 70)
-sStroke.Thickness = 1.5
-
-local sTitle = Instance.new("TextLabel", shopFrame)
-sTitle.Size = UDim2.new(1, -50, 0, 30)
-sTitle.Position = UDim2.fromOffset(12, 4)
-sTitle.BackgroundTransparency = 1
-sTitle.Font = Enum.Font.GothamBold
-sTitle.Text = "🛒 ร้านค้าและตลาด (Shop System)"
-sTitle.TextColor3 = Color3.fromRGB(255, 180, 80)
-sTitle.TextSize = 15
-sTitle.TextXAlignment = Enum.TextXAlignment.Left
-
-local closeSBtn = Instance.new("TextButton", shopFrame)
-closeSBtn.Name = "CloseShopBtn"
-closeSBtn.Size = UDim2.fromOffset(26, 26)
-closeSBtn.Position = UDim2.new(1, -34, 0, 8)
-closeSBtn.BackgroundColor3 = Color3.fromRGB(45, 40, 50)
-closeSBtn.Font = Enum.Font.GothamBold
-closeSBtn.Text = "✕"
-closeSBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-closeSBtn.TextSize = 13
-local closeSCorner = Instance.new("UICorner", closeSBtn)
-closeSCorner.CornerRadius = UDim.new(0, 6)
-closeSBtn.Activated:Connect(function()
-    shopFrame.Visible = false
-end)
-
-merchantTimerLabel = Instance.new("TextLabel", shopFrame)
-merchantTimerLabel.Size = UDim2.new(1, -24, 0, 18)
-merchantTimerLabel.Position = UDim2.fromOffset(12, 32)
-merchantTimerLabel.BackgroundTransparency = 1
-merchantTimerLabel.Font = Enum.Font.Gotham
-merchantTimerLabel.Text = "⏳ Merchant รีเฟรชใน: --:--:--  |  Currency Shop ใน: --:--:--"
-merchantTimerLabel.TextColor3 = Color3.fromRGB(200, 200, 215)
-merchantTimerLabel.TextSize = 11
-merchantTimerLabel.TextXAlignment = Enum.TextXAlignment.Left
-
-local currentShopTab = "Currency"
-
-local merchantPage = Instance.new("Frame", shopFrame)
-merchantPage.Name = "MerchantPage"
-merchantPage.Size = UDim2.new(1, -20, 1, -95)
-merchantPage.Position = UDim2.fromOffset(10, 88)
-merchantPage.BackgroundTransparency = 1
-merchantPage.Visible = false
-
-local currencyPage = Instance.new("Frame", shopFrame)
-currencyPage.Name = "CurrencyPage"
-currencyPage.Size = UDim2.new(1, -20, 1, -95)
-currencyPage.Position = UDim2.fromOffset(10, 88)
-currencyPage.BackgroundTransparency = 1
-currencyPage.Visible = true
-
-local shopConfigPage = Instance.new("ScrollingFrame", shopFrame)
-shopConfigPage.Name = "ShopConfigPage"
-shopConfigPage.Size = UDim2.new(1, -20, 1, -95)
-shopConfigPage.Position = UDim2.fromOffset(10, 88)
-shopConfigPage.BackgroundTransparency = 1
-shopConfigPage.BorderSizePixel = 0
-shopConfigPage.ScrollBarThickness = 4
-shopConfigPage.Visible = false
-
-local tabBtn1 = Instance.new("TextButton", shopFrame)
-tabBtn1.Size = UDim2.new(0.33, -6, 0, 30)
-tabBtn1.Position = UDim2.fromOffset(10, 52)
-tabBtn1.BackgroundColor3 = Color3.fromRGB(45, 42, 55)
-tabBtn1.Font = Enum.Font.GothamBold
-tabBtn1.Text = "🛒 Merchant (Rare)"
-tabBtn1.TextColor3 = Color3.fromRGB(220, 220, 220)
-tabBtn1.TextSize = 11
-local t1c = Instance.new("UICorner", tabBtn1)
-t1c.CornerRadius = UDim.new(0, 6)
-
-local tabBtn2 = Instance.new("TextButton", shopFrame)
-tabBtn2.Size = UDim2.new(0.33, -6, 0, 30)
-tabBtn2.Position = UDim2.new(0.33, 7, 0, 52)
-tabBtn2.BackgroundColor3 = Color3.fromRGB(255, 170, 70)
-tabBtn2.Font = Enum.Font.GothamBold
-tabBtn2.Text = "🪙 Currency Shop"
-tabBtn2.TextColor3 = Color3.fromRGB(25, 20, 30)
-tabBtn2.TextSize = 11
-local t2c = Instance.new("UICorner", tabBtn2)
-t2c.CornerRadius = UDim.new(0, 6)
-
-local tabBtn3 = Instance.new("TextButton", shopFrame)
-tabBtn3.Size = UDim2.new(0.33, -6, 0, 30)
-tabBtn3.Position = UDim2.new(0.66, 4, 0, 52)
-tabBtn3.BackgroundColor3 = Color3.fromRGB(45, 42, 55)
-tabBtn3.Font = Enum.Font.GothamBold
-tabBtn3.Text = "⚙️ ตั้งค่า Auto Buy"
-tabBtn3.TextColor3 = Color3.fromRGB(220, 220, 220)
-tabBtn3.TextSize = 11
-local t3c = Instance.new("UICorner", tabBtn3)
-t3c.CornerRadius = UDim.new(0, 6)
-
-local function switchShopTab(tab)
-    currentShopTab = tab
-    merchantPage.Visible = (tab == "Merchant")
-    currencyPage.Visible = (tab == "Currency")
-    shopConfigPage.Visible = (tab == "Config")
-
-    tabBtn1.BackgroundColor3 = (tab == "Merchant") and Color3.fromRGB(255, 170, 70) or Color3.fromRGB(45, 42, 55)
-    tabBtn1.TextColor3 = (tab == "Merchant") and Color3.fromRGB(25, 20, 30) or Color3.fromRGB(220, 220, 220)
-
-    tabBtn2.BackgroundColor3 = (tab == "Currency") and Color3.fromRGB(255, 170, 70) or Color3.fromRGB(45, 42, 55)
-    tabBtn2.TextColor3 = (tab == "Currency") and Color3.fromRGB(25, 20, 30) or Color3.fromRGB(220, 220, 220)
-
-    tabBtn3.BackgroundColor3 = (tab == "Config") and Color3.fromRGB(255, 170, 70) or Color3.fromRGB(45, 42, 55)
-    tabBtn3.TextColor3 = (tab == "Config") and Color3.fromRGB(25, 20, 30) or Color3.fromRGB(220, 220, 220)
-end
-
-tabBtn1.Activated:Connect(function() switchShopTab("Merchant") end)
-tabBtn2.Activated:Connect(function() switchShopTab("Currency") end)
-tabBtn3.Activated:Connect(function() switchShopTab("Config") end)
-
--- 1. MERCHANT PAGE
-local refreshMerchantBtn = Instance.new("TextButton", merchantPage)
-refreshMerchantBtn.Size = UDim2.new(1, 0, 0, 26)
-refreshMerchantBtn.Position = UDim2.fromOffset(0, 0)
-refreshMerchantBtn.BackgroundColor3 = Color3.fromRGB(52, 73, 94)
-refreshMerchantBtn.Font = Enum.Font.GothamSemibold
-refreshMerchantBtn.Text = "🔄 กดรีเฟรชเช็คของใน Merchant"
-refreshMerchantBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-refreshMerchantBtn.TextSize = 12
-local rCorner = Instance.new("UICorner", refreshMerchantBtn)
-rCorner.CornerRadius = UDim.new(0, 6)
-
-stockContainer = Instance.new("ScrollingFrame", merchantPage)
-stockContainer.Size = UDim2.new(1, 0, 1, -32)
-stockContainer.Position = UDim2.fromOffset(0, 32)
-stockContainer.BackgroundTransparency = 1
-stockContainer.BorderSizePixel = 0
-stockContainer.ScrollBarThickness = 4
-
-local stockLayout = Instance.new("UIListLayout", stockContainer)
-stockLayout.Padding = UDim.new(0, 6)
-stockLayout.SortOrder = Enum.SortOrder.LayoutOrder
-
-local function renderMerchantCards()
-    for _, child in ipairs(stockContainer:GetChildren()) do
-        if child:IsA("Frame") then child:Destroy() end
-    end
-
-    local info = cachedMerchantInfo or fetchMerchantInfo()
-    if not info or not info.Stock then
-        local emptyLbl = Instance.new("TextLabel", stockContainer)
-        emptyLbl.Size = UDim2.new(1, 0, 0, 60)
-        emptyLbl.BackgroundTransparency = 1
-        emptyLbl.Text = "ไม่พบข้อมูลสต็อก กรุณากดปุ่มรีเฟรช"
-        emptyLbl.TextColor3 = Color3.fromRGB(150, 150, 150)
-        emptyLbl.Font = Enum.Font.Gotham
-        emptyLbl.TextSize = 13
-        return
-    end
-
-    local count = 0
-    for _, offer in ipairs(info.Stock) do
-        count = count + 1
-        local left = getLeftStock(offer, info.Bought)
-        local cur = offer.Currency or "Gold"
-        local curIcon = (cur == "Gold") and "🟡 Gold" or "💎 Gems"
-        local itemName = offer.Item or "Item"
-        local totalQty = (offer.Amount or 1)
-        local price = offer.Price or 0
-
-        local card = Instance.new("Frame", stockContainer)
-        card.Size = UDim2.new(1, -6, 0, 44)
-        card.BackgroundColor3 = Color3.fromRGB(32, 29, 42)
-        local cCorner = Instance.new("UICorner", card)
-        cCorner.CornerRadius = UDim.new(0, 6)
-
-        local nameLbl = Instance.new("TextLabel", card)
-        nameLbl.Size = UDim2.new(1, -85, 0, 22)
-        nameLbl.Position = UDim2.fromOffset(8, 2)
-        nameLbl.BackgroundTransparency = 1
-        nameLbl.Font = Enum.Font.GothamBold
-        nameLbl.Text = string.format("%s (x%d)", itemName, totalQty)
-        nameLbl.TextColor3 = offer.Rare and Color3.fromRGB(255, 215, 0) or Color3.fromRGB(240, 240, 240)
-        nameLbl.TextSize = 13
-        nameLbl.TextXAlignment = Enum.TextXAlignment.Left
-
-        local infoLbl = Instance.new("TextLabel", card)
-        infoLbl.Size = UDim2.new(1, -85, 0, 18)
-        infoLbl.Position = UDim2.fromOffset(8, 22)
-        infoLbl.BackgroundTransparency = 1
-        infoLbl.Font = Enum.Font.Gotham
-        infoLbl.Text = string.format("ราคา: %s %s | เหลือ: %d ชิ้น", price, curIcon, left)
-        infoLbl.TextColor3 = Color3.fromRGB(180, 180, 190)
-        infoLbl.TextSize = 11
-        infoLbl.TextXAlignment = Enum.TextXAlignment.Left
-
-        local buyNowBtn = Instance.new("TextButton", card)
-        buyNowBtn.Size = UDim2.fromOffset(70, 30)
-        buyNowBtn.Position = UDim2.new(1, -76, 0.5, -15)
-        buyNowBtn.Font = Enum.Font.GothamBold
-        buyNowBtn.TextSize = 11
-        local bCorner = Instance.new("UICorner", buyNowBtn)
-        bCorner.CornerRadius = UDim.new(0, 6)
-
-        if left > 0 then
-            buyNowBtn.BackgroundColor3 = Color3.fromRGB(46, 204, 113)
-            buyNowBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-            buyNowBtn.Text = "ซื้อทันที"
-            buyNowBtn.Activated:Connect(function()
-                local ok, err = buySingleMerchantItem(offer.Key, 1)
-                if ok then
-                    notify("🛒 ซื้อสำเร็จ", "ซื้อ " .. itemName .. " เรียบร้อย!", 2)
-                    fetchMerchantInfo()
-                    renderMerchantCards()
-                else
-                    notify("🛒 ไม่สำเร็จ", err or "ไม่สามารถซื้อได้", 3)
-                end
-            end)
-        else
-            buyNowBtn.BackgroundColor3 = Color3.fromRGB(55, 52, 65)
-            buyNowBtn.TextColor3 = Color3.fromRGB(130, 130, 130)
-            buyNowBtn.Text = "หมดแล้ว"
-        end
-    end
-
-    stockContainer.CanvasSize = UDim2.new(0, 0, 0, count * 50)
-end
-
-refreshMerchantBtn.Activated:Connect(function()
-    fetchMerchantInfo()
-    renderMerchantCards()
-    notify("🛒 Merchant", "อัปเดตข้อมูลร้านค้าเรียบร้อย!", 2)
-end)
-
--- 2. CURRENCY SHOP PAGE
-local refreshCurrencyBtn = Instance.new("TextButton", currencyPage)
-refreshCurrencyBtn.Size = UDim2.new(1, 0, 0, 26)
-refreshCurrencyBtn.Position = UDim2.fromOffset(0, 0)
-refreshCurrencyBtn.BackgroundColor3 = Color3.fromRGB(52, 73, 94)
-refreshCurrencyBtn.Font = Enum.Font.GothamSemibold
-refreshCurrencyBtn.Text = "🔄 กดรีเฟรชเช็คของใน Currency Shop"
-refreshCurrencyBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-refreshCurrencyBtn.TextSize = 12
-local rcCorner = Instance.new("UICorner", refreshCurrencyBtn)
-rcCorner.CornerRadius = UDim.new(0, 6)
-
-currencyContainer = Instance.new("ScrollingFrame", currencyPage)
-currencyContainer.Size = UDim2.new(1, 0, 1, -32)
-currencyContainer.Position = UDim2.fromOffset(0, 32)
-currencyContainer.BackgroundTransparency = 1
-currencyContainer.BorderSizePixel = 0
-currencyContainer.ScrollBarThickness = 4
-
-local curLayout = Instance.new("UIListLayout", currencyContainer)
-curLayout.Padding = UDim.new(0, 6)
-curLayout.SortOrder = Enum.SortOrder.LayoutOrder
-
-local function renderCurrencyShopCards()
-    for _, child in ipairs(currencyContainer:GetChildren()) do
-        if child:IsA("Frame") or child:IsA("TextLabel") then child:Destroy() end
-    end
-
-    local stateOk, state = pcall(function() return Request:InvokeServer("GetState") end)
-    state = (stateOk and state) or {}
-    local activeColors = (Config and Config.ShopColorsNow and Config.ShopColorsNow()) or {}
-
-    local totalCards = 0
-
-    local function addSectionTitle(text, color)
-        local sec = Instance.new("TextLabel", currencyContainer)
-        sec.Size = UDim2.new(1, -6, 0, 24)
-        sec.BackgroundTransparency = 1
-        sec.Font = Enum.Font.GothamBold
-        sec.Text = text
-        sec.TextColor3 = color
-        sec.TextSize = 13
-        sec.TextXAlignment = Enum.TextXAlignment.Left
-        totalCards = totalCards + 0.5
-    end
-
-    local function renderOfferItem(offer)
-        totalCards = totalCards + 1
-        local left = getCurrencyShopLeft(offer, state)
-        local cur = offer.Currency or "Gold"
-        local curIcon = (cur == "Gold") and "🟡 Gold" or "💎 Gems"
-        local itemName = offer.Name or offer.Item
-
-        local isAvailable = true
-        local note = ""
-        if offer.Rotates then
-            isAvailable = (activeColors[offer.Item] == true)
-            note = isAvailable and " [เปิดขายรอบนี้]" or " [รอบนี้ปิด]"
-        end
-
-        local card = Instance.new("Frame", currencyContainer)
-        card.Size = UDim2.new(1, -6, 0, 44)
-        card.BackgroundColor3 = isAvailable and Color3.fromRGB(32, 29, 42) or Color3.fromRGB(25, 23, 30)
-        local cc = Instance.new("UICorner", card)
-        cc.CornerRadius = UDim.new(0, 6)
-
-        local nameLbl = Instance.new("TextLabel", card)
-        nameLbl.Size = UDim2.new(1, -85, 0, 22)
-        nameLbl.Position = UDim2.fromOffset(8, 2)
-        nameLbl.BackgroundTransparency = 1
-        nameLbl.Font = Enum.Font.GothamBold
-        nameLbl.Text = itemName .. note
-        nameLbl.TextColor3 = isAvailable and Color3.fromRGB(240, 240, 240) or Color3.fromRGB(120, 120, 130)
-        nameLbl.TextSize = 12
-        nameLbl.TextXAlignment = Enum.TextXAlignment.Left
-
-        local infoLbl = Instance.new("TextLabel", card)
-        infoLbl.Size = UDim2.new(1, -85, 0, 18)
-        infoLbl.Position = UDim2.fromOffset(8, 22)
-        infoLbl.BackgroundTransparency = 1
-        infoLbl.Font = Enum.Font.Gotham
-        infoLbl.Text = string.format("ราคา: %d %s | เหลือ: %d/%d", offer.Price, curIcon, left, offer.Stock or 1)
-        infoLbl.TextColor3 = Color3.fromRGB(180, 180, 190)
-        infoLbl.TextSize = 11
-        infoLbl.TextXAlignment = Enum.TextXAlignment.Left
-
-        local buyBtn = Instance.new("TextButton", card)
-        buyBtn.Size = UDim2.fromOffset(70, 30)
-        buyBtn.Position = UDim2.new(1, -76, 0.5, -15)
-        buyBtn.Font = Enum.Font.GothamBold
-        buyBtn.TextSize = 11
-        local bc = Instance.new("UICorner", buyBtn)
-        bc.CornerRadius = UDim.new(0, 6)
-
-        if isAvailable and left > 0 then
-            buyBtn.BackgroundColor3 = Color3.fromRGB(46, 204, 113)
-            buyBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-            buyBtn.Text = "ซื้อทันที"
-            buyBtn.Activated:Connect(function()
-                local ok, err = buyCurrencyShopItem(offer, 1)
-                if ok then
-                    notify("🪙 ซื้อสำเร็จ", "ซื้อ " .. itemName .. " เรียบร้อย!", 2)
-                    renderCurrencyShopCards()
-                else
-                    notify("🪙 ไม่สำเร็จ", err or "ไม่สามารถซื้อได้", 3)
-                end
-            end)
-        else
-            buyBtn.BackgroundColor3 = Color3.fromRGB(55, 52, 65)
-            buyBtn.TextColor3 = Color3.fromRGB(130, 130, 130)
-            buyBtn.Text = (not isAvailable) and "ปิดขาย" or "หมดแล้ว"
-        end
-    end
-
-    addSectionTitle("🪙 Gold Shop (ใช้ Gold)", Color3.fromRGB(241, 196, 15))
-    for _, offer in ipairs(currencyShopDB.Gold) do
-        renderOfferItem(offer)
-    end
-
-    addSectionTitle("💎 Gem Shop (ใช้ Gems)", Color3.fromRGB(255, 120, 200))
-    for _, offer in ipairs(currencyShopDB.Gems) do
-        renderOfferItem(offer)
-    end
-
-    currencyContainer.CanvasSize = UDim2.new(0, 0, 0, totalCards * 52)
-end
-
-refreshCurrencyBtn.Activated:Connect(function()
-    renderCurrencyShopCards()
-    notify("🪙 Currency Shop", "อัปเดตข้อมูลร้านค้าเรียบร้อย!", 2)
-end)
-
--- 3. CONFIG PAGE
-local cfgLayout = Instance.new("UIListLayout", shopConfigPage)
-cfgLayout.Padding = UDim.new(0, 6)
-cfgLayout.SortOrder = Enum.SortOrder.LayoutOrder
-
-local function createShopToggleRow(name, labelText, tbl, key)
-    local row = Instance.new("TextButton", shopConfigPage)
-    row.Name = name
-    row.Size = UDim2.new(1, -6, 0, 32)
-    row.BackgroundColor3 = tbl[key] and Color3.fromRGB(39, 174, 96) or Color3.fromRGB(45, 42, 55)
-    row.Font = Enum.Font.GothamSemibold
-    row.Text = string.format("%s: [ %s ]", labelText, tbl[key] and "เปิด" or "ปิด")
-    row.TextColor3 = Color3.fromRGB(255, 255, 255)
-    row.TextSize = 12
-    local rc = Instance.new("UICorner", row)
-    rc.CornerRadius = UDim.new(0, 6)
-
-    row.Activated:Connect(function()
-        tbl[key] = not tbl[key]
-        if tbl[key] then
-            row.BackgroundColor3 = Color3.fromRGB(39, 174, 96)
-            row.Text = string.format("%s: [ เปิด ]", labelText)
-        else
-            row.BackgroundColor3 = Color3.fromRGB(45, 42, 55)
-            row.Text = string.format("%s: [ ปิด ]", labelText)
-        end
-        queueSave()  -- ✨ บันทึกเมื่อเปลี่ยนค่า
-    end)
-    return row
-end
-
-local function addConfigHeader(text, color)
-    local hdr = Instance.new("TextLabel", shopConfigPage)
-    hdr.Size = UDim2.new(1, -6, 0, 22)
-    hdr.BackgroundTransparency = 1
-    hdr.Font = Enum.Font.GothamBold
-    hdr.Text = text
-    hdr.TextColor3 = color
-    hdr.TextSize = 13
-    hdr.TextXAlignment = Enum.TextXAlignment.Left
-end
-
-addConfigHeader("🪙 ตั้งค่า Currency Shop (Gold & Gems):", Color3.fromRGB(241, 196, 15))
-createShopToggleRow("TogGoldShop", "💰 ซื้อของ Gold Shop ทั้งหมด (Dango, Dust, Runes)", currencyShopConfig, "buyAllGold")
-createShopToggleRow("TogScroll", "📜 ซื้อ Skill Scroll (สมุดสกิล 150 Gems)", currencyShopConfig, "buyScroll")
-createShopToggleRow("TogTrait", "🔮 ซื้อ Trait Crystal (100 Gems)", currencyShopConfig, "buyTrait")
-createShopToggleRow("TogStar", "⭐ ซื้อ Star Shard (300 Gems)", currencyShopConfig, "buyStar")
-createShopToggleRow("TogGems", "💎 ซื้อหินธาตุหมุนเวียน (Green/Yellow/Red/Pink/Purple)", currencyShopConfig, "buyRotatingGems")
-createShopToggleRow("TogShards", "👥 ซื้อเศษตัวละคร (Mythic / Legendary Shards)", currencyShopConfig, "buyShards")
-
-addConfigHeader("🛒 ตั้งค่า Merchant Shop (Rare Goods):", Color3.fromRGB(255, 170, 70))
-createShopToggleRow("TogMGold", "💰 ซื้อของที่ใช้ Gold ทั้งหมด (Merchant)", merchantConfig, "buyAllGold")
-createShopToggleRow("TogMLuck", "⭐ ซื้อน้ำยา Luck (Super/Ultra)", merchantConfig, "buyLuck")
-createShopToggleRow("TogMRainbow", "🌈 ซื้อ Rainbow Shard (Merchant)", merchantConfig, "buyRainbow")
-createShopToggleRow("TogMTrait", "🔮 ซื้อ Trait Crystal (Merchant)", merchantConfig, "buyTrait")
-createShopToggleRow("TogMStar", "⭐ ซื้อ Star Shard (Merchant)", merchantConfig, "buyStar")
-createShopToggleRow("TogMEvo", "🧬 ซื้อไอเทม Evo ทั้งหมด", merchantConfig, "buyEvo")
-createShopToggleRow("TogMChips", "⚡ ซื้อ Stat Chip (ปกติ/Super)", merchantConfig, "buyChips")
-
-local buyCurNowBtn = Instance.new("TextButton", shopConfigPage)
-buyCurNowBtn.Size = UDim2.new(1, -6, 0, 36)
-buyCurNowBtn.BackgroundColor3 = Color3.fromRGB(241, 196, 15)
-buyCurNowBtn.Font = Enum.Font.GothamBold
-buyCurNowBtn.Text = "⚡ ซื้อของที่เลือกใน Currency Shop เดี๋ยวนี้"
-buyCurNowBtn.TextColor3 = Color3.fromRGB(25, 20, 30)
-buyCurNowBtn.TextSize = 12
-local bcnCorner = Instance.new("UICorner", buyCurNowBtn)
-bcnCorner.CornerRadius = UDim.new(0, 6)
-buyCurNowBtn.Activated:Connect(function()
-    runCurrencyShopAutoBuy(false)
-    renderCurrencyShopCards()
-end)
-
-local buyMerchantNowBtn = Instance.new("TextButton", shopConfigPage)
-buyMerchantNowBtn.Size = UDim2.new(1, -6, 0, 36)
-buyMerchantNowBtn.BackgroundColor3 = Color3.fromRGB(230, 126, 34)
-buyMerchantNowBtn.Font = Enum.Font.GothamBold
-buyMerchantNowBtn.Text = "⚡ ซื้อของที่เลือกใน Merchant เดี๋ยวนี้"
-buyMerchantNowBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-buyMerchantNowBtn.TextSize = 12
-local bmnCorner = Instance.new("UICorner", buyMerchantNowBtn)
-bmnCorner.CornerRadius = UDim.new(0, 6)
-buyMerchantNowBtn.Activated:Connect(function()
-    runMerchantAutoBuy(false)
-    renderMerchantCards()
-end)
-
-loopShopBtn = Instance.new("TextButton", shopConfigPage)
-loopShopBtn.Size = UDim2.new(1, -6, 0, 36)
-loopShopBtn.BackgroundColor3 = isAutoShopLoop and Color3.fromRGB(46, 204, 113) or Color3.fromRGB(45, 42, 55)
-loopShopBtn.Font = Enum.Font.GothamBold
-loopShopBtn.Text = string.format("⏳ วนลูป Auto Buy ทุกร้าน: [ %s ]", isAutoShopLoop and "เปิด" or "ปิด")
-loopShopBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-loopShopBtn.TextSize = 12
-local lsCorner = Instance.new("UICorner", loopShopBtn)
-lsCorner.CornerRadius = UDim.new(0, 6)
-loopShopBtn.Activated:Connect(function()
-    toggleAllShopLoop()
-end)
-
--- ✨ ปุ่ม Restock Exit Battle
-local restockExitBtn = Instance.new("TextButton", shopConfigPage)
-restockExitBtn.Size = UDim2.new(1, -6, 0, 36)
-restockExitBtn.BackgroundColor3 = restockExitBattle and Color3.fromRGB(39, 174, 96) or Color3.fromRGB(45, 42, 55)
-restockExitBtn.Font = Enum.Font.GothamBold
-restockExitBtn.Text = string.format("🔔 ร้านรีเซ็ต → จบด่านแล้วออกมาซื้อ: [ %s ]", restockExitBattle and "เปิด" or "ปิด")
-restockExitBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-restockExitBtn.TextSize = 11.5
-local reCorner = Instance.new("UICorner", restockExitBtn)
-reCorner.CornerRadius = UDim.new(0, 6)
-restockExitBtn.Activated:Connect(function()
-    restockExitBattle = not restockExitBattle
-    if restockExitBattle then
-        restockExitBtn.BackgroundColor3 = Color3.fromRGB(39, 174, 96)
-        restockExitBtn.Text = "🔔 ร้านรีเซ็ต → จบด่านแล้วออกมาซื้อ: [ เปิด ]"
-    else
-        restockExitBtn.BackgroundColor3 = Color3.fromRGB(45, 42, 55)
-        restockExitBtn.Text = "🔔 ร้านรีเซ็ต → จบด่านแล้วออกมาซื้อ: [ ปิด ]"
-    end
-    queueSave()
-end)
-
-shopConfigPage.CanvasSize = UDim2.new(0, 0, 0, 20 * 38)
-
-task.spawn(function()
-    while true do
-        task.wait(1)
-        if shopFrame and shopFrame.Visible then
-            local info = cachedMerchantInfo or fetchMerchantInfo()
-            local mRemain = (info and info.EndsAt) and (info.EndsAt - getServerTime()) or 0
-            local cRemain = 3600 - (getServerTime() % 3600)
-
-            if merchantTimerLabel then
-                merchantTimerLabel.Text = string.format("⏳ Merchant ใน: %s  |  Currency Shop ใน: %s", formatClock(mRemain), formatClock(cRemain))
-            end
-
-            if mRemain <= 0 and mRemain > -2 then
-                task.wait(1.5)
-                fetchMerchantInfo()
-                if currentShopTab == "Merchant" then renderMerchantCards() end
-            end
-
-            if cRemain <= 1 then
-                task.wait(1.5)
-                if currentShopTab == "Currency" then renderCurrencyShopCards() end
-            end
-        end
-    end
-end)
-
--- ----------------- ENHANCED AUTO PLAY / AUTO FARM SUB-FRAME -----------------
-autoFarmFrame = Instance.new("Frame")
-autoFarmFrame.Name = "AutoFarmFrame"
-autoFarmFrame.Size = UDim2.fromOffset(380, 500)
-autoFarmFrame.Position = UDim2.new(0.5, -40, 0.18, 0)
-autoFarmFrame.BackgroundColor3 = Color3.fromRGB(24, 20, 28)
-autoFarmFrame.BorderSizePixel = 0
-autoFarmFrame.Active = true
-autoFarmFrame.Draggable = true
-autoFarmFrame.Visible = false
-autoFarmFrame.Parent = screenGui
-
-local fCorner = Instance.new("UICorner", autoFarmFrame)
-fCorner.CornerRadius = UDim.new(0, 10)
-
-local fStroke = Instance.new("UIStroke", autoFarmFrame)
-fStroke.Color = Color3.fromRGB(231, 76, 60)
-fStroke.Thickness = 1.5
-
-local fTitle = Instance.new("TextLabel", autoFarmFrame)
-fTitle.Size = UDim2.new(1, -50, 0, 30)
-fTitle.Position = UDim2.fromOffset(12, 4)
-fTitle.BackgroundTransparency = 1
-fTitle.Font = Enum.Font.GothamBold
-fTitle.Text = "⚔️ ระบบ Auto Play & Auto Farm v2.0"
-fTitle.TextColor3 = Color3.fromRGB(255, 105, 90)
-fTitle.TextSize = 15
-fTitle.TextXAlignment = Enum.TextXAlignment.Left
-
-local closeFBtn = Instance.new("TextButton", autoFarmFrame)
-closeFBtn.Name = "CloseFarmBtn"
-closeFBtn.Size = UDim2.fromOffset(26, 26)
-closeFBtn.Position = UDim2.new(1, -34, 0, 8)
-closeFBtn.BackgroundColor3 = Color3.fromRGB(45, 40, 50)
-closeFBtn.Font = Enum.Font.GothamBold
-closeFBtn.Text = "✕"
-closeFBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-closeFBtn.TextSize = 13
-local closeFCorner = Instance.new("UICorner", closeFBtn)
-closeFCorner.CornerRadius = UDim.new(0, 6)
-closeFBtn.Activated:Connect(function()
-    autoFarmFrame.Visible = false
-end)
-
-farmInfoLabel = Instance.new("TextLabel", autoFarmFrame)
-farmInfoLabel.Size = UDim2.new(1, -24, 0, 20)
-farmInfoLabel.Position = UDim2.fromOffset(12, 34)
-farmInfoLabel.BackgroundTransparency = 1
-farmInfoLabel.Font = Enum.Font.GothamSemibold
-farmInfoLabel.Text = "🎯 กำลังเลือก: [Story] W1 Namekku - ด่าน 1"
-farmInfoLabel.TextColor3 = Color3.fromRGB(240, 200, 120)
-farmInfoLabel.TextSize = 11.5
-farmInfoLabel.TextXAlignment = Enum.TextXAlignment.Left
-
--- ✨ แสดงสถานะ Save
-local saveStatusLabel = Instance.new("TextLabel", autoFarmFrame)
-saveStatusLabel.Size = UDim2.new(1, -24, 0, 14)
-saveStatusLabel.Position = UDim2.fromOffset(12, 52)
-saveStatusLabel.BackgroundTransparency = 1
-saveStatusLabel.Font = Enum.Font.Gotham
-saveStatusLabel.Text = savedData and "💾 โหลดการตั้งค่าที่บันทึกไว้เรียบร้อย" or "💾 ยังไม่มีการบันทึก (ตั้งค่าแล้วจะ auto-save)"
-saveStatusLabel.TextColor3 = Color3.fromRGB(120, 220, 120)
-saveStatusLabel.TextSize = 10
-saveStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
-
-local farmScroll = Instance.new("ScrollingFrame", autoFarmFrame)
-farmScroll.Size = UDim2.new(1, -20, 1, -78)
-farmScroll.Position = UDim2.fromOffset(10, 70)
-farmScroll.BackgroundTransparency = 1
-farmScroll.BorderSizePixel = 0
-farmScroll.ScrollBarThickness = 4
-farmScroll.CanvasSize = UDim2.new(0, 0, 0, 700)
-
-local fList = Instance.new("UIListLayout", farmScroll)
-fList.Padding = UDim.new(0, 8)
-fList.SortOrder = Enum.SortOrder.LayoutOrder
-
-local function updateFarmInfoText()
-    local cfg = _G.AnimeAshura_AutoFarm
-    local mode = cfg.Mode or "Story"
-    local world = cfg.World or 1
-    local stage = cfg.Stage or 1
-    local diff = cfg.Difficulty or "Easy"
-
-    local modeData = stageDB[mode]
-    local wData = modeData and modeData[world]
-    local sData = wData and wData.Stages and wData.Stages[stage]
-
-    local wName = wData and wData.Name or ("World " .. world)
-    local sName = sData and sData.Name or ("ด่าน " .. stage)
-    local bName = sData and sData.Boss or "บอส"
-
-    farmInfoLabel.Text = string.format("🎯 [%s] %s • %s (บอส: %s) [%s]", mode, wName, sName, bName, diff)
-end
-
--- 1. เลือกโหมด
-local modeHeader = Instance.new("TextLabel", farmScroll)
-modeHeader.Size = UDim2.new(1, 0, 0, 18)
-modeHeader.BackgroundTransparency = 1
-modeHeader.Font = Enum.Font.GothamBold
-modeHeader.Text = "1. เลือกโหมดเกม (Game Mode):"
-modeHeader.TextColor3 = Color3.fromRGB(220, 220, 230)
-modeHeader.TextSize = 12.5
-modeHeader.TextXAlignment = Enum.TextXAlignment.Left
-
-local modeContainer = Instance.new("Frame", farmScroll)
-modeContainer.Size = UDim2.new(1, -6, 0, 30)
-modeContainer.BackgroundTransparency = 1
-
-local modeBtns = {}
-local modesList = {
-    { Id = "Story", Name = "Story (เนื้อเรื่อง)" },
-    { Id = "Raid", Name = "Raid (เรด)" },
-    { Id = "Castle", Name = "Castle (หอคอย)" },
-    { Id = "Challenge", Name = "Challenge" }
+local GUI_NAME = "AnimeAshuraHub"
+
+local C = {
+    bg = Color3.fromRGB(20, 18, 25),
+    panel = Color3.fromRGB(30, 27, 38),
+    card = Color3.fromRGB(36, 33, 46),
+    cardOn = Color3.fromRGB(28, 54, 40),
+    off = Color3.fromRGB(55, 51, 68),
+    disabled = Color3.fromRGB(32, 30, 38),
+    on = Color3.fromRGB(39, 174, 96),
+    accent = Color3.fromRGB(255, 120, 200),
+    text = Color3.fromRGB(240, 240, 245),
+    sub = Color3.fromRGB(180, 180, 195),
+    dim = Color3.fromRGB(105, 102, 115),
+    dark = Color3.fromRGB(25, 20, 30),
+    white = Color3.fromRGB(255, 255, 255),
+    blue = Color3.fromRGB(52, 152, 219),
+    steel = Color3.fromRGB(52, 73, 94),
+    orange = Color3.fromRGB(230, 126, 34),
+    shop = Color3.fromRGB(255, 170, 70),
+    purple = Color3.fromRGB(155, 89, 182),
+    luck = Color3.fromRGB(156, 39, 176),
+    red = Color3.fromRGB(231, 76, 60),
+    gold = Color3.fromRGB(241, 196, 15),
+    stroke = Color3.fromRGB(80, 75, 100),
+    danger = Color3.fromRGB(130, 32, 45)
 }
 
-for i, m in ipairs(modesList) do
-    local btn = Instance.new("TextButton", modeContainer)
-    btn.Size = UDim2.new(0.25, -4, 1, 0)
-    btn.Position = UDim2.new((i - 1) * 0.25, 2, 0, 0)
-    btn.Font = Enum.Font.GothamBold
-    btn.Text = m.Name
-    btn.TextSize = 10
-    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    btn.BackgroundColor3 = (_G.AnimeAshura_AutoFarm.Mode == m.Id) and Color3.fromRGB(231, 76, 60) or Color3.fromRGB(45, 42, 55)
-    local bc = Instance.new("UICorner", btn)
-    bc.CornerRadius = UDim.new(0, 6)
-
-    btn.Activated:Connect(function()
-        _G.AnimeAshura_AutoFarm.Mode = m.Id
-        _G.AnimeAshura_AutoFarm.World = 1
-        _G.AnimeAshura_AutoFarm.Stage = 1
-        for _, b in pairs(modeBtns) do b.BackgroundColor3 = Color3.fromRGB(45, 42, 55) end
-        btn.BackgroundColor3 = Color3.fromRGB(231, 76, 60)
-        updateFarmInfoText()
-        queueSave()  -- ✨ Auto-save
-    end)
-    modeBtns[m.Id] = btn
-end
-
--- 2. เลือก World
-local worldHeader = Instance.new("TextLabel", farmScroll)
-worldHeader.Size = UDim2.new(1, 0, 0, 18)
-worldHeader.BackgroundTransparency = 1
-worldHeader.Font = Enum.Font.GothamBold
-worldHeader.Text = "2. เลือก World (แมพ/โลก):"
-worldHeader.TextColor3 = Color3.fromRGB(220, 220, 230)
-worldHeader.TextSize = 12.5
-worldHeader.TextXAlignment = Enum.TextXAlignment.Left
-
-local worldContainer = Instance.new("Frame", farmScroll)
-worldContainer.Size = UDim2.new(1, -6, 0, 30)
-worldContainer.BackgroundTransparency = 1
-
-local worldBtns = {}
-local worldsList = {
-    { Id = 1, Name = "1. Namekku" },
-    { Id = 2, Name = "2. Hidden Village" },
-    { Id = 3, Name = "3. Shibuya" },
-    { Id = 4, Name = "4. Hueko Mundo" }
-}
-
-for i, w in ipairs(worldsList) do
-    local btn = Instance.new("TextButton", worldContainer)
-    btn.Size = UDim2.new(0.25, -4, 1, 0)
-    btn.Position = UDim2.new((i - 1) * 0.25, 2, 0, 0)
-    btn.Font = Enum.Font.GothamBold
-    btn.Text = w.Name
-    btn.TextSize = 9.5
-    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    btn.BackgroundColor3 = (_G.AnimeAshura_AutoFarm.World == w.Id) and Color3.fromRGB(52, 152, 219) or Color3.fromRGB(45, 42, 55)
-    local bc = Instance.new("UICorner", btn)
-    bc.CornerRadius = UDim.new(0, 6)
-
-    btn.Activated:Connect(function()
-        _G.AnimeAshura_AutoFarm.World = w.Id
-        _G.AnimeAshura_AutoFarm.Stage = 1
-        for _, b in pairs(worldBtns) do b.BackgroundColor3 = Color3.fromRGB(45, 42, 55) end
-        btn.BackgroundColor3 = Color3.fromRGB(52, 152, 219)
-        updateFarmInfoText()
-        queueSave()  -- ✨ Auto-save
-    end)
-    worldBtns[w.Id] = btn
-end
-
--- 3. เลือก Stage
-local stageHeader = Instance.new("TextLabel", farmScroll)
-stageHeader.Size = UDim2.new(1, 0, 0, 18)
-stageHeader.BackgroundTransparency = 1
-stageHeader.Font = Enum.Font.GothamBold
-stageHeader.Text = "3. เลือก Stage (ด่านที่ 1 - 6):"
-stageHeader.TextColor3 = Color3.fromRGB(220, 220, 230)
-stageHeader.TextSize = 12.5
-stageHeader.TextXAlignment = Enum.TextXAlignment.Left
-
-local stageContainer = Instance.new("Frame", farmScroll)
-stageContainer.Size = UDim2.new(1, -6, 0, 30)
-stageContainer.BackgroundTransparency = 1
-
-local stageBtns = {}
-for i = 1, 6 do
-    local btn = Instance.new("TextButton", stageContainer)
-    btn.Size = UDim2.new(0.166, -4, 1, 0)
-    btn.Position = UDim2.new((i - 1) * 0.166, 2, 0, 0)
-    btn.Font = Enum.Font.GothamBold
-    btn.Text = "ด่าน " .. i
-    btn.TextSize = 11
-    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    btn.BackgroundColor3 = (_G.AnimeAshura_AutoFarm.Stage == i) and Color3.fromRGB(155, 89, 182) or Color3.fromRGB(45, 42, 55)
-    local bc = Instance.new("UICorner", btn)
-    bc.CornerRadius = UDim.new(0, 6)
-
-    btn.Activated:Connect(function()
-        _G.AnimeAshura_AutoFarm.Stage = i
-        for _, b in pairs(stageBtns) do b.BackgroundColor3 = Color3.fromRGB(45, 42, 55) end
-        btn.BackgroundColor3 = Color3.fromRGB(155, 89, 182)
-        updateFarmInfoText()
-        queueSave()  -- ✨ Auto-save
-    end)
-    stageBtns[i] = btn
-end
-
--- 4. เลือกระดับความยาก
-local diffHeader = Instance.new("TextLabel", farmScroll)
-diffHeader.Size = UDim2.new(1, 0, 0, 18)
-diffHeader.BackgroundTransparency = 1
-diffHeader.Font = Enum.Font.GothamBold
-diffHeader.Text = "4. เลือกระดับความยาก (Difficulty):"
-diffHeader.TextColor3 = Color3.fromRGB(220, 220, 230)
-diffHeader.TextSize = 12.5
-diffHeader.TextXAlignment = Enum.TextXAlignment.Left
-
-local diffContainer = Instance.new("Frame", farmScroll)
-diffContainer.Size = UDim2.new(1, -6, 0, 30)
-diffContainer.BackgroundTransparency = 1
-
-local diffBtns = {}
-local diffsList = {
-    { Id = "Easy", Name = "Easy (ง่าย)", Color = Color3.fromRGB(46, 204, 113) },
-    { Id = "Medium", Name = "Medium (ปานกลาง)", Color = Color3.fromRGB(241, 196, 15) },
-    { Id = "Hard", Name = "Hard (ยาก)", Color = Color3.fromRGB(231, 76, 60) }
-}
-
-for i, d in ipairs(diffsList) do
-    local btn = Instance.new("TextButton", diffContainer)
-    btn.Size = UDim2.new(0.333, -4, 1, 0)
-    btn.Position = UDim2.new((i - 1) * 0.333, 2, 0, 0)
-    btn.Font = Enum.Font.GothamBold
-    btn.Text = d.Name
-    btn.TextSize = 11
-    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    btn.BackgroundColor3 = (_G.AnimeAshura_AutoFarm.Difficulty == d.Id) and d.Color or Color3.fromRGB(45, 42, 55)
-    local bc = Instance.new("UICorner", btn)
-    bc.CornerRadius = UDim.new(0, 6)
-
-    btn.Activated:Connect(function()
-        _G.AnimeAshura_AutoFarm.Difficulty = d.Id
-        for _, b in pairs(diffBtns) do b.BackgroundColor3 = Color3.fromRGB(45, 42, 55) end
-        btn.BackgroundColor3 = d.Color
-        updateFarmInfoText()
-        queueSave()  -- ✨ Auto-save
-    end)
-    diffBtns[d.Id] = btn
-end
-
--- 5. การตั้งค่า Battle Automation
-local optHeader = Instance.new("TextLabel", farmScroll)
-optHeader.Size = UDim2.new(1, 0, 0, 18)
-optHeader.BackgroundTransparency = 1
-optHeader.Font = Enum.Font.GothamBold
-optHeader.Text = "5. ตั้งค่าการต่อสู้และตัวช่วย (Battle Automation):"
-optHeader.TextColor3 = Color3.fromRGB(241, 196, 15)
-optHeader.TextSize = 12.5
-optHeader.TextXAlignment = Enum.TextXAlignment.Left
-
--- ปุ่ม Auto Skills
-autoSkillsBtn = Instance.new("TextButton", farmScroll)
-autoSkillsBtn.Size = UDim2.new(1, -6, 0, 32)
-autoSkillsBtn.BackgroundColor3 = _G.AnimeAshura_AutoFarm.AutoSkills and Color3.fromRGB(39, 174, 96) or Color3.fromRGB(45, 42, 55)
-autoSkillsBtn.Font = Enum.Font.GothamSemibold
-autoSkillsBtn.Text = string.format("⚡ Auto Skills (บอทกดสกิลเอง 100%%): [ %s ]", _G.AnimeAshura_AutoFarm.AutoSkills and "เปิด" or "ปิด")
-autoSkillsBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-autoSkillsBtn.TextSize = 12
-local askc = Instance.new("UICorner", autoSkillsBtn)
-askc.CornerRadius = UDim.new(0, 6)
-autoSkillsBtn.Activated:Connect(function()
-    _G.AnimeAshura_AutoFarm.AutoSkills = not _G.AnimeAshura_AutoFarm.AutoSkills
-    if _G.AnimeAshura_AutoFarm.AutoSkills then
-        autoSkillsBtn.BackgroundColor3 = Color3.fromRGB(39, 174, 96)
-        autoSkillsBtn.Text = "⚡ Auto Skills (บอทกดสกิลเอง 100%): [ เปิด ]"
-        pcall(function() Request:InvokeServer("TeamAuto", true) end)
-    else
-        autoSkillsBtn.BackgroundColor3 = Color3.fromRGB(45, 42, 55)
-        autoSkillsBtn.Text = "⚡ Auto Skills (บอทกดสกิลเอง 100%): [ ปิด ]"
-        pcall(function() Request:InvokeServer("TeamAuto", false) end)
-    end
-    queueSave()
-end)
-
--- ปุ่ม Auto Replay
-autoReplayBtn = Instance.new("TextButton", farmScroll)
-autoReplayBtn.Size = UDim2.new(1, -6, 0, 32)
-autoReplayBtn.BackgroundColor3 = _G.AnimeAshura_AutoFarm.AutoReplay and Color3.fromRGB(39, 174, 96) or Color3.fromRGB(45, 42, 55)
-autoReplayBtn.Font = Enum.Font.GothamSemibold
-autoReplayBtn.Text = string.format("🔄 Auto-Replay (เล่นด่านเดิมซ้ำ ไม่กลับล็อบบี้): [ %s ]", _G.AnimeAshura_AutoFarm.AutoReplay and "เปิด" or "ปิด")
-autoReplayBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-autoReplayBtn.TextSize = 11.5
-local arpc = Instance.new("UICorner", autoReplayBtn)
-arpc.CornerRadius = UDim.new(0, 6)
-autoReplayBtn.Activated:Connect(function()
-    _G.AnimeAshura_AutoFarm.AutoReplay = not _G.AnimeAshura_AutoFarm.AutoReplay
-    if _G.AnimeAshura_AutoFarm.AutoReplay then
-        _G.AnimeAshura_AutoFarm.AutoNext = false
-        if autoNextBtn then
-            autoNextBtn.BackgroundColor3 = Color3.fromRGB(45, 42, 55)
-            autoNextBtn.Text = "⏩ Auto-Next (ลุยด่านถัดไปอัตโนมัติเมื่อชนะ): [ ปิด ]"
-        end
-        autoReplayBtn.BackgroundColor3 = Color3.fromRGB(39, 174, 96)
-        autoReplayBtn.Text = "🔄 Auto-Replay (เล่นด่านเดิมซ้ำ ไม่กลับล็อบบี้): [ เปิด ]"
-        pcall(function()
-            Request:InvokeServer("BattleSetting", "AutoReplay", true)
-            Request:InvokeServer("BattleSetting", "AutoNext", false)
-        end)
-    else
-        autoReplayBtn.BackgroundColor3 = Color3.fromRGB(45, 42, 55)
-        autoReplayBtn.Text = "🔄 Auto-Replay (เล่นด่านเดิมซ้ำ ไม่กลับล็อบบี้): [ ปิด ]"
-        pcall(function() Request:InvokeServer("BattleSetting", "AutoReplay", false) end)
-    end
-    queueSave()
-end)
-
--- ปุ่ม Auto Next
-autoNextBtn = Instance.new("TextButton", farmScroll)
-autoNextBtn.Size = UDim2.new(1, -6, 0, 32)
-autoNextBtn.BackgroundColor3 = _G.AnimeAshura_AutoFarm.AutoNext and Color3.fromRGB(39, 174, 96) or Color3.fromRGB(45, 42, 55)
-autoNextBtn.Font = Enum.Font.GothamSemibold
-autoNextBtn.Text = string.format("⏩ Auto-Next (ลุยด่านถัดไปอัตโนมัติเมื่อชนะ): [ %s ]", _G.AnimeAshura_AutoFarm.AutoNext and "เปิด" or "ปิด")
-autoNextBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-autoNextBtn.TextSize = 11.5
-local anxc = Instance.new("UICorner", autoNextBtn)
-anxc.CornerRadius = UDim.new(0, 6)
-autoNextBtn.Activated:Connect(function()
-    _G.AnimeAshura_AutoFarm.AutoNext = not _G.AnimeAshura_AutoFarm.AutoNext
-    if _G.AnimeAshura_AutoFarm.AutoNext then
-        _G.AnimeAshura_AutoFarm.AutoReplay = false
-        if autoReplayBtn then
-            autoReplayBtn.BackgroundColor3 = Color3.fromRGB(45, 42, 55)
-            autoReplayBtn.Text = "🔄 Auto-Replay (เล่นด่านเดิมซ้ำ ไม่กลับล็อบบี้): [ ปิด ]"
-        end
-        autoNextBtn.BackgroundColor3 = Color3.fromRGB(39, 174, 96)
-        autoNextBtn.Text = "⏩ Auto-Next (ลุยด่านถัดไปอัตโนมัติเมื่อชนะ): [ เปิด ]"
-        pcall(function()
-            Request:InvokeServer("BattleSetting", "AutoNext", true)
-            Request:InvokeServer("BattleSetting", "AutoReplay", false)
-        end)
-    else
-        autoNextBtn.BackgroundColor3 = Color3.fromRGB(45, 42, 55)
-        autoNextBtn.Text = "⏩ Auto-Next (ลุยด่านถัดไปอัตโนมัติเมื่อชนะ): [ ปิด ]"
-        pcall(function() Request:InvokeServer("BattleSetting", "AutoNext", false) end)
-    end
-    queueSave()
-end)
-
--- ปุ่ม Low Graphics
-lowGfxBtn = Instance.new("TextButton", farmScroll)
-lowGfxBtn.Size = UDim2.new(1, -6, 0, 32)
-lowGfxBtn.BackgroundColor3 = _G.AnimeAshura_AutoFarm.LowGraphics and Color3.fromRGB(39, 174, 96) or Color3.fromRGB(45, 42, 55)
-lowGfxBtn.Font = Enum.Font.GothamSemibold
-lowGfxBtn.Text = string.format("💨 โหมดลดแล็ก (Low Detail & ปิดเอฟเฟกต์): [ %s ]", _G.AnimeAshura_AutoFarm.LowGraphics and "เปิด" or "ปิด")
-lowGfxBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-lowGfxBtn.TextSize = 11.5
-local lgc = Instance.new("UICorner", lowGfxBtn)
-lgc.CornerRadius = UDim.new(0, 6)
-lowGfxBtn.Activated:Connect(function()
-    _G.AnimeAshura_AutoFarm.LowGraphics = not _G.AnimeAshura_AutoFarm.LowGraphics
-    if _G.AnimeAshura_AutoFarm.LowGraphics then
-        lowGfxBtn.BackgroundColor3 = Color3.fromRGB(39, 174, 96)
-        lowGfxBtn.Text = "💨 โหมดลดแล็ก (Low Detail & ปิดเอฟเฟกต์): [ เปิด ]"
-        pcall(function()
-            Request:InvokeServer("BattleSetting", "LowDetail", true)
-            Request:InvokeServer("BattleSetting", "NoVfx", true)
-            Request:InvokeServer("BattleSetting", "NoNumbers", true)
-        end)
-    else
-        lowGfxBtn.BackgroundColor3 = Color3.fromRGB(45, 42, 55)
-        lowGfxBtn.Text = "💨 โหมดลดแล็ก (Low Detail & ปิดเอฟเฟกต์): [ ปิด ]"
-        pcall(function()
-            Request:InvokeServer("BattleSetting", "LowDetail", false)
-            Request:InvokeServer("BattleSetting", "NoVfx", false)
-            Request:InvokeServer("BattleSetting", "NoNumbers", false)
-        end)
-    end
-    queueSave()
-end)
-
--- ปุ่ม Solo Room
-local soloToggleBtn = Instance.new("TextButton", farmScroll)
-soloToggleBtn.Size = UDim2.new(1, -6, 0, 32)
-soloToggleBtn.BackgroundColor3 = _G.AnimeAshura_AutoFarm.Solo and Color3.fromRGB(39, 174, 96) or Color3.fromRGB(45, 42, 55)
-soloToggleBtn.Font = Enum.Font.GothamSemibold
-soloToggleBtn.Text = string.format("🔒 ล็อกเล่นคนเดียว (Solo Mode - ปิดห้อง): [ %s ]", _G.AnimeAshura_AutoFarm.Solo and "เปิด" or "ปิด")
-soloToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-soloToggleBtn.TextSize = 11.5
-local sc = Instance.new("UICorner", soloToggleBtn)
-sc.CornerRadius = UDim.new(0, 6)
-soloToggleBtn.Activated:Connect(function()
-    _G.AnimeAshura_AutoFarm.Solo = not _G.AnimeAshura_AutoFarm.Solo
-    if _G.AnimeAshura_AutoFarm.Solo then
-        soloToggleBtn.BackgroundColor3 = Color3.fromRGB(39, 174, 96)
-        soloToggleBtn.Text = "🔒 ล็อกเล่นคนเดียว (Solo Mode - ปิดห้อง): [ เปิด ]"
-    else
-        soloToggleBtn.BackgroundColor3 = Color3.fromRGB(45, 42, 55)
-        soloToggleBtn.Text = "🔒 ล็อกเล่นคนเดียว (Solo Mode - ปิดห้อง): [ ปิด ]"
-    end
-    queueSave()
-end)
-
--- ✨ ปุ่มวนลูป Auto Farm (ปรับปรุงให้มี Re-entry Loop จริง)
-farmLoopBtn = Instance.new("TextButton", farmScroll)
-farmLoopBtn.Size = UDim2.new(1, -6, 0, 34)
-farmLoopBtn.BackgroundColor3 = _G.AnimeAshura_AutoFarm.Enabled and Color3.fromRGB(46, 204, 113) or Color3.fromRGB(45, 42, 55)
-farmLoopBtn.Font = Enum.Font.GothamBold
-farmLoopBtn.Text = string.format("🔁 วนลูป Auto Farm (เข้าด่าน → เล่น → เข้าซ้ำ): [ %s ]", _G.AnimeAshura_AutoFarm.Enabled and "เปิด" or "ปิด")
-farmLoopBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-farmLoopBtn.TextSize = 11.5
-local flc = Instance.new("UICorner", farmLoopBtn)
-flc.CornerRadius = UDim.new(0, 6)
-farmLoopBtn.Activated:Connect(function()
-    _G.AnimeAshura_AutoFarm.Enabled = not _G.AnimeAshura_AutoFarm.Enabled
-    if _G.AnimeAshura_AutoFarm.Enabled then
-        farmLoopBtn.BackgroundColor3 = Color3.fromRGB(46, 204, 113)
-        farmLoopBtn.Text = "🔁 วนลูป Auto Farm (เข้าด่าน → เล่น → เข้าซ้ำ): [ เปิด ]"
-        notify("⚔️ Auto Farm", "เปิดวนลูป Auto Farm! กำลังเข้าห้องและเริ่มด่าน...", 3)
-        enterAndStartAutoPlay()
-    else
-        farmLoopBtn.BackgroundColor3 = Color3.fromRGB(45, 42, 55)
-        farmLoopBtn.Text = "🔁 วนลูป Auto Farm (เข้าด่าน → เล่น → เข้าซ้ำ): [ ปิด ]"
-        notify("⚔️ Auto Farm", "ปิดวนลูป Auto Farm เรียบร้อย", 2)
-    end
-    queueSave()
-end)
-
--- ปุ่ม เริ่มทันที
-local startNowBtn = Instance.new("TextButton", farmScroll)
-startNowBtn.Size = UDim2.new(1, -6, 0, 40)
-startNowBtn.BackgroundColor3 = Color3.fromRGB(46, 204, 113)
-startNowBtn.Font = Enum.Font.GothamBold
-startNowBtn.Text = "🚀 เริ่ม Auto Play เดี๋ยวนี้ (เข้าห้อง & ลุยด่านทันที)"
-startNowBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-startNowBtn.TextSize = 13
-local snc = Instance.new("UICorner", startNowBtn)
-snc.CornerRadius = UDim.new(0, 8)
-startNowBtn.Activated:Connect(function()
-    enterAndStartAutoPlay()
-end)
-
--- ปุ่ม ออกจากห้อง
-local leaveBtn = Instance.new("TextButton", farmScroll)
-leaveBtn.Size = UDim2.new(1, -6, 0, 32)
-leaveBtn.BackgroundColor3 = Color3.fromRGB(60, 55, 70)
-leaveBtn.Font = Enum.Font.GothamSemibold
-leaveBtn.Text = "🚪 ออกจากห้องเดิม (Leave Current Room)"
-leaveBtn.TextColor3 = Color3.fromRGB(220, 220, 220)
-leaveBtn.TextSize = 12
-local lbc = Instance.new("UICorner", leaveBtn)
-lbc.CornerRadius = UDim.new(0, 6)
-leaveBtn.Activated:Connect(function()
-    leaveCurrentRoom()
-end)
-
-updateFarmInfoText()
-
--- ==========================================
--- Background Tasks
--- ==========================================
-
--- ✨ Task 1: Lobby Auto Re-entry Loop (ตรวจจับตลอดเวลาว่าอยู่ Lobby + Farm เปิดอยู่)
-task.spawn(function()
-    -- รอตัวละครโหลดเสร็จ
-    local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-    char:WaitForChild("HumanoidRootPart", 10)
-    task.wait(3)
-
-    -- ✨ ถ้ามี restock ค้าง → ซื้อของก่อนเข้าด่าน
-    if _restockPending then
-        _restockPending = false
-        notify("🛒 Restock", "กลับมาที่ Lobby แล้ว! กำลังซื้อของ...", 3)
-        task.wait(2)
-        runMerchantAutoBuy(false)
-        task.wait(0.5)
-        runCurrencyShopAutoBuy(false)
-        task.wait(1)
-    end
-
-    -- ✨ ถ้าบันทึกไว้ว่าเปิด Auto Farm อยู่ ให้เริ่มเข้าห้องทันที
-    if _G.AnimeAshura_AutoFarm and _G.AnimeAshura_AutoFarm.Enabled then
-        if game.PlaceId == 81532592154280 then
-            print("[AutoFarm Loop] บันทึกไว้ว่าเปิดอยู่ → กำลังเข้าห้องอัตโนมัติ...")
-            enterAndStartAutoPlay()
+-- เลือกที่วาง GUI: gethui (Delta รองรับ) → CoreGui → PlayerGui
+local function pickGuiParent()
+    if type(gethui) == "function" then
+        local ok, h = pcall(gethui)
+        if ok and typeof(h) == "Instance" then
+            return h
         end
     end
+    local ok, core = pcall(function()
+        local cg = game:GetService("CoreGui")
+        local probe = Instance.new("Folder")
+        probe.Name = "AAH_Probe"
+        probe.Parent = cg
+        probe:Destroy()
+        return cg
+    end)
+    if ok and core then
+        return core
+    end
+    return LocalPlayer:WaitForChild("PlayerGui")
+end
 
-    -- ✨ Lobby Re-entry Loop: ตรวจจับทุก 5 วินาทีว่าอยู่ Lobby + Farm เปิด → เข้าด่านอัตโนมัติ
-    while true do
-        task.wait(5)
-        if _G.AnimeAshura_AutoFarm and _G.AnimeAshura_AutoFarm.Enabled then
-            -- ต้องอยู่ใน Lobby Place (ไม่ใช่ Battle Place)
-            if game.PlaceId == 81532592154280 then
-                -- ต้องไม่กำลังเข้าห้องอยู่แล้ว
-                if not isStartingRoom then
-                    print("[AutoFarm Loop] ตรวจพบอยู่ใน Lobby + Farm เปิดอยู่ → เข้าห้องอัตโนมัติ")
-                    enterAndStartAutoPlay()
-                end
+local function removeOldGui(parent)
+    if not parent then return end
+    pcall(function()
+        for _, ch in ipairs(parent:GetChildren()) do
+            if ch.Name == GUI_NAME then
+                ch:Destroy()
+            end
+        end
+    end)
+end
+
+local guiParent = pickGuiParent()
+removeOldGui(guiParent)
+pcall(function() removeOldGui(game:GetService("CoreGui")) end)
+removeOldGui(LocalPlayer:FindFirstChildOfClass("PlayerGui"))
+
+local function new(className, props, parent)
+    local obj = Instance.new(className)
+    if props then
+        for k, v in pairs(props) do
+            obj[k] = v
+        end
+    end
+    if parent then
+        obj.Parent = parent
+    end
+    return obj
+end
+
+local function corner(obj, r)
+    return new("UICorner", { CornerRadius = UDim.new(0, r or 8) }, obj)
+end
+
+-- ข้อความย่อ/ขยายเองให้พอดีปุ่มบนจอเล็ก
+local function textFit(obj, maxSize, minSize)
+    obj.TextScaled = true
+    obj.TextWrapped = true
+    new("UITextSizeConstraint", { MaxTextSize = maxSize or 14, MinTextSize = minSize or 8 }, obj)
+end
+
+local orderN = 0
+local function nextOrder()
+    orderN = orderN + 1
+    return orderN
+end
+
+-- ผูกปุ่มแบบกันกดรัว: ระหว่างงานเดิมยังไม่เสร็จ การแตะซ้ำจะถูกข้าม
+local function bindTap(btn, fn)
+    local busy = false
+    btn.Activated:Connect(function()
+        if busy then return end
+        busy = true
+        local ok, err = pcall(fn)
+        busy = false
+        if not ok then
+            warn("[AAH:UI] " .. tostring(err))
+            notify("⚠️ ผิดพลาด", tostring(err), 4)
+        end
+    end)
+end
+
+screenGui = new("ScreenGui", {
+    Name = GUI_NAME,
+    ResetOnSpawn = false,
+    IgnoreGuiInset = false,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    DisplayOrder = 999
+})
+screenGui.Parent = guiParent
+
+local function screenSize()
+    local s = screenGui and screenGui.AbsoluteSize
+    if s and s.X > 50 and s.Y > 50 then
+        return s
+    end
+    local cam = workspace.CurrentCamera
+    local vp = cam and cam.ViewportSize or Vector2.new(800, 400)
+    local inset = GuiService:GetGuiInset()
+    return Vector2.new(vp.X, vp.Y - inset.Y)
+end
+
+-- ขนาดหน้าต่างตามจอ: มือถือแนวนอนจะได้ประมาณ 430x340
+local function windowSize()
+    local s = screenSize()
+    local w = math.floor(math.clamp(s.X - 20, 260, 430))
+    local h = math.floor(math.clamp(s.Y - 16, 220, 460))
+    return w, h
+end
+
+local function clampXY(x, y, w, h)
+    local s = screenSize()
+    x = math.clamp(x, 0, math.max(0, s.X - w))
+    y = math.clamp(y, 0, math.max(0, s.Y - h))
+    return math.floor(x), math.floor(y)
+end
+
+-- ลากด้วยนิ้ว/เมาส์ได้ และคืนฟังก์ชันบอกว่าการแตะครั้งล่าสุดเป็นการลากหรือไม่
+local function makeDraggable(handles, target)
+    local dragging = false
+    local dragInput, startInputPos, startPos = nil, nil, nil
+    local moved = false
+
+    local function begin(input)
+        local t = input.UserInputType
+        if t ~= Enum.UserInputType.Touch and t ~= Enum.UserInputType.MouseButton1 then
+            return
+        end
+        dragging = true
+        moved = false
+        dragInput = input
+        startInputPos = input.Position
+        startPos = Vector2.new(target.Position.X.Offset, target.Position.Y.Offset)
+    end
+
+    for _, h in ipairs(handles) do
+        h.InputBegan:Connect(begin)
+    end
+
+    track(UserInputService.InputChanged:Connect(function(input)
+        if not dragging then return end
+        if input ~= dragInput and input.UserInputType ~= Enum.UserInputType.MouseMovement then
+            return
+        end
+        local d = input.Position - startInputPos
+        if math.abs(d.X) + math.abs(d.Y) > 8 then
+            moved = true
+        end
+        local size = target.AbsoluteSize
+        local x, y = clampXY(startPos.X + d.X, startPos.Y + d.Y, size.X, size.Y)
+        target.Position = UDim2.fromOffset(x, y)
+    end))
+
+    track(UserInputService.InputEnded:Connect(function(input)
+        if input == dragInput or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = false
+            dragInput = nil
+        end
+    end))
+
+    return function() return moved end
+end
+
+-- ----------------- MAIN WINDOW -----------------
+local main = new("Frame", {
+    Name = "Main",
+    BackgroundColor3 = C.bg,
+    BorderSizePixel = 0,
+    Active = true,
+    ClipsDescendants = true,
+    Size = UDim2.fromOffset(360, 320),
+    Position = UDim2.fromOffset(10, 10)
+}, screenGui)
+corner(main, 12)
+new("UIStroke", { Color = C.stroke, Thickness = 1.5, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }, main)
+
+local header = new("Frame", {
+    Name = "Header",
+    BackgroundColor3 = C.panel,
+    BorderSizePixel = 0,
+    Active = true,
+    Size = UDim2.new(1, 0, 0, 40)
+}, main)
+corner(header, 12)
+
+local titleLbl = new("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(12, 0),
+    Size = UDim2.new(1, -70, 1, 0),
+    Font = Enum.Font.GothamBold,
+    Text = "Anime Ashura Hub v2.1 📱",
+    TextColor3 = C.accent,
+    TextXAlignment = Enum.TextXAlignment.Left
+}, header)
+textFit(titleLbl, 16, 10)
+
+local minBtn = new("TextButton", {
+    AnchorPoint = Vector2.new(1, 0.5),
+    Position = UDim2.new(1, -8, 0.5, 0),
+    Size = UDim2.fromOffset(44, 30),
+    BackgroundColor3 = C.off,
+    BorderSizePixel = 0,
+    Font = Enum.Font.GothamBold,
+    Text = "—",
+    TextSize = 16,
+    TextColor3 = C.text
+}, header)
+corner(minBtn, 8)
+
+local tabBar = new("Frame", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(8, 44),
+    Size = UDim2.new(1, -16, 0, 34)
+}, main)
+new("UIListLayout", {
+    FillDirection = Enum.FillDirection.Horizontal,
+    Padding = UDim.new(0, 4),
+    SortOrder = Enum.SortOrder.LayoutOrder
+}, tabBar)
+
+local content = new("Frame", {
+    BackgroundTransparency = 1,
+    ClipsDescendants = true,
+    Position = UDim2.fromOffset(6, 82),
+    Size = UDim2.new(1, -12, 1, -112)
+}, main)
+
+statusLabel = new("TextLabel", {
+    AnchorPoint = Vector2.new(0, 1),
+    Position = UDim2.new(0, 0, 1, 0),
+    Size = UDim2.new(1, 0, 0, 26),
+    BackgroundColor3 = C.panel,
+    BorderSizePixel = 0,
+    Font = Enum.Font.Gotham,
+    Text = "พร้อมใช้งาน • " .. (IN_BATTLE and "อยู่ในด่าน" or "อยู่ Lobby"),
+    TextColor3 = C.sub,
+    TextSize = 12,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextTruncate = Enum.TextTruncate.AtEnd
+}, main)
+new("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, statusLabel)
+
+-- ----------------- FLOATING TOGGLE BUTTON -----------------
+local floatBtn = new("TextButton", {
+    Name = "ToggleButton",
+    Size = UDim2.fromOffset(52, 52),
+    Position = UDim2.fromOffset(8, 120),
+    BackgroundColor3 = C.panel,
+    BorderSizePixel = 0,
+    Font = Enum.Font.GothamBold,
+    Text = "AH",
+    TextSize = 16,
+    TextColor3 = C.accent,
+    ZIndex = 10
+}, screenGui)
+corner(floatBtn, 26)
+local floatStroke = new("UIStroke", { Color = C.accent, Thickness = 2, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }, floatBtn)
+
+local function setWindowOpen(open, save)
+    main.Visible = open
+    floatStroke.Color = open and C.accent or C.stroke
+    floatBtn.TextColor3 = open and C.accent or C.sub
+    if save and G.uiMinimized ~= (not open) then
+        G.uiMinimized = not open
+        queueSave()
+    end
+end
+
+local floatWasDragged = makeDraggable({ floatBtn }, floatBtn)
+makeDraggable({ header, titleLbl }, main)
+
+floatBtn.Activated:Connect(function()
+    if floatWasDragged() then return end
+    setWindowOpen(not main.Visible, true)
+end)
+minBtn.Activated:Connect(function()
+    setWindowOpen(false, true)
+end)
+
+-- ----------------- PAGES / TABS -----------------
+local pages, tabBtns = {}, {}
+local currentTab = nil
+local switchTab, renderShop, refreshFarmUI
+
+local function makePage(id, label, order)
+    local page = new("ScrollingFrame", {
+        Name = id,
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Size = UDim2.fromScale(1, 1),
+        CanvasSize = UDim2.new(0, 0, 0, 0),
+        ScrollBarThickness = 5,
+        ScrollBarImageColor3 = C.stroke,
+        ScrollingDirection = Enum.ScrollingDirection.Y,
+        Active = true,
+        Visible = false
+    }, content)
+    new("UIPadding", {
+        PaddingTop = UDim.new(0, 4),
+        PaddingBottom = UDim.new(0, 8),
+        PaddingLeft = UDim.new(0, 2),
+        PaddingRight = UDim.new(0, 9)
+    }, page)
+    local layout = new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, page)
+    local function fit()
+        page.CanvasSize = UDim2.fromOffset(0, layout.AbsoluteContentSize.Y + 16)
+    end
+    layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(fit)
+    fit()
+
+    local tb = new("TextButton", {
+        Size = UDim2.new(0.25, -3, 1, 0),
+        LayoutOrder = order,
+        BackgroundColor3 = C.off,
+        BorderSizePixel = 0,
+        Font = Enum.Font.GothamBold,
+        Text = label,
+        TextColor3 = C.text
+    }, tabBar)
+    corner(tb, 8)
+    textFit(tb, 13, 8)
+    tb.Activated:Connect(function()
+        switchTab(id)
+    end)
+
+    pages[id] = page
+    tabBtns[id] = tb
+    return page
+end
+
+switchTab = function(id)
+    currentTab = id
+    for pid, p in pairs(pages) do
+        p.Visible = (pid == id)
+    end
+    for pid, b in pairs(tabBtns) do
+        local on = (pid == id)
+        b.BackgroundColor3 = on and C.accent or C.off
+        b.TextColor3 = on and C.dark or C.text
+    end
+    if id == "shop" and renderShop then
+        task.spawn(renderShop)
+    elseif id == "farm" and refreshFarmUI then
+        refreshFarmUI()
+    end
+end
+
+-- ----------------- UI COMPONENTS -----------------
+local function section(parent, text, color)
+    return new("TextLabel", {
+        BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 0, 22),
+        Font = Enum.Font.GothamBold,
+        Text = text,
+        TextColor3 = color or C.text,
+        TextSize = 14,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        LayoutOrder = nextOrder()
+    }, parent)
+end
+
+local function infoText(parent, text, color, height)
+    local l = new("TextLabel", {
+        BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 0, height or 20),
+        Font = Enum.Font.GothamSemibold,
+        Text = text,
+        TextColor3 = color or C.sub,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        LayoutOrder = nextOrder()
+    }, parent)
+    textFit(l, 13, 8)
+    return l
+end
+
+local function actionButton(parent, text, color, fn, textColor)
+    local b = new("TextButton", {
+        Size = UDim2.new(1, 0, 0, 44),
+        BackgroundColor3 = color,
+        BorderSizePixel = 0,
+        Font = Enum.Font.GothamBold,
+        Text = text,
+        TextColor3 = textColor or C.white,
+        LayoutOrder = nextOrder()
+    }, parent)
+    corner(b, 8)
+    textFit(b, 14, 8)
+    new("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }, b)
+    bindTap(b, fn)
+    return b
+end
+
+-- แถวเปิด/ปิด: แตะตรงไหนของแถวก็ได้ (เป้าใหญ่ กดง่ายบนมือถือ)
+local function toggleRow(parent, label, get, set)
+    local row = new("TextButton", {
+        Size = UDim2.new(1, 0, 0, 44),
+        BackgroundColor3 = C.card,
+        BorderSizePixel = 0,
+        Text = "",
+        LayoutOrder = nextOrder()
+    }, parent)
+    corner(row, 8)
+
+    local lbl = new("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(10, 0),
+        Size = UDim2.new(1, -88, 1, 0),
+        Font = Enum.Font.GothamSemibold,
+        Text = label,
+        TextColor3 = C.text,
+        TextXAlignment = Enum.TextXAlignment.Left
+    }, row)
+    textFit(lbl, 13, 8)
+
+    local pill = new("TextLabel", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -8, 0.5, 0),
+        Size = UDim2.fromOffset(64, 28),
+        BackgroundColor3 = C.off,
+        BorderSizePixel = 0,
+        Font = Enum.Font.GothamBold,
+        Text = "ปิด",
+        TextSize = 13,
+        TextColor3 = C.white
+    }, row)
+    corner(pill, 14)
+
+    local function refresh()
+        local on = get() and true or false
+        pill.Text = on and "เปิด" or "ปิด"
+        pill.BackgroundColor3 = on and C.on or C.off
+        row.BackgroundColor3 = on and C.cardOn or C.card
+    end
+
+    bindTap(row, function()
+        set(not get())
+        refresh()
+    end)
+    refresh()
+    return refresh
+end
+
+-- แถวปุ่มเลือก 1 ตัวเลือก (โหมด / World / ด่าน / ความยาก)
+local function segmented(parent, items, opts)
+    local n = #items
+    local row = new("Frame", {
+        BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 0, opts.height or 38),
+        LayoutOrder = nextOrder()
+    }, parent)
+    new("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        Padding = UDim.new(0, 4),
+        SortOrder = Enum.SortOrder.LayoutOrder
+    }, row)
+
+    local btns = {}
+    local function refresh()
+        local current = opts.get()
+        for _, it in ipairs(items) do
+            local b = btns[it.id]
+            local avail = (opts.available == nil) or opts.available(it.id)
+            if opts.label then
+                b.Text = opts.label(it.id)
+            end
+            if current == it.id and avail then
+                b.BackgroundColor3 = (opts.colorFn and opts.colorFn(it.id)) or opts.color or C.accent
+                b.TextColor3 = C.white
+            elseif avail then
+                b.BackgroundColor3 = C.off
+                b.TextColor3 = C.text
+            else
+                b.BackgroundColor3 = C.disabled
+                b.TextColor3 = C.dim
             end
         end
     end
-end)
 
--- Task 2: Battle Place auto-skills & button clicker
-task.spawn(function()
-    while true do
-        task.wait(2)
-        local placeId = game.PlaceId
-        if placeId == 112575319532871 then
-            if _G.AnimeAshura_AutoFarm and _G.AnimeAshura_AutoFarm.AutoSkills then
-                pcall(function() Request:InvokeServer("TeamAuto", true) end)
-            end
+    local gap = 4 * (n - 1) / n
+    for i, it in ipairs(items) do
+        local b = new("TextButton", {
+            Size = UDim2.new(1 / n, -gap, 1, 0),
+            LayoutOrder = i,
+            BackgroundColor3 = C.off,
+            BorderSizePixel = 0,
+            Font = Enum.Font.GothamBold,
+            Text = it.text or tostring(it.id),
+            TextColor3 = C.text
+        }, row)
+        corner(b, 7)
+        textFit(b, 13, 7)
+        new("UIPadding", { PaddingLeft = UDim.new(0, 3), PaddingRight = UDim.new(0, 3) }, b)
+        btns[it.id] = b
 
-            local pGui = LocalPlayer:FindFirstChild("PlayerGui")
-            if pGui then
-                for _, g in ipairs(pGui:GetChildren()) do
-                    if g:IsA("ScreenGui") and g.Enabled then
-                        for _, btn in ipairs(g:GetDescendants()) do
-                            if btn:IsA("TextButton") and btn.Visible then
-                                local txt = string.lower(btn.Text)
-                                if string.find(txt, "replay") or string.find(txt, "vote") or string.find(txt, "again") or string.find(txt, "next") then
-                                    -- ✨ ถ้ามี restock pending → กดปุ่มกลับ lobby แทน
-                                    if _restockPending then
-                                        if string.find(txt, "lobby") or string.find(txt, "return") or string.find(txt, "leave") or string.find(txt, "exit") then
-                                            pcall(function() firesignal(btn.Activated) end)
-                                        end
-                                    else
-                                        pcall(function() firesignal(btn.Activated) end)
-                                    end
-                                end
-                            end
-                        end
-                    end
-                end
+        b.Activated:Connect(function()
+            if opts.available and not opts.available(it.id) then
+                setStatus("ตัวเลือกนี้ไม่มีในโหมดที่เลือก")
+                return
             end
-        end
+            local ok, err = pcall(opts.set, it.id)
+            if not ok then
+                warn("[AAH:UI] " .. tostring(err))
+            end
+            refresh()
+        end)
     end
+
+    refresh()
+    return refresh
+end
+
+local pageMain = makePage("main", "🏠 หลัก", 1)
+local pageFarm = makePage("farm", "⚔️ ฟาร์ม", 2)
+local pageShop = makePage("shop", "🛒 ร้าน", 3)
+local pageSet = makePage("settings", "⚙️ ตั้งค่า", 4)
+
+-- ================= แท็บ: หลัก =================
+section(pageMain, "🎁 รางวัล & โค้ด", C.blue)
+actionButton(pageMain, "🎁 รับเควส / รางวัลทั้งหมด", C.blue, function()
+    claimAllEverything(false)
 end)
-
--- ✨ Task 3: Restock Exit Watcher (ระบบเฝ้าดูเวลารีเซ็ตร้านค้า)
-runRestockExitWatcher()
-
--- ----------------- MAIN FRAME BUTTONS -----------------
-
--- 1. ปุ่มรับเควสทันที
-createButton("ClaimBtn", "🎁 รับเควส / รางวัลทั้งหมด", UDim2.fromOffset(12, 45), Color3.fromRGB(52, 152, 219), function()
-    claimAllEverything()
-end)
-
--- 2. ปุ่มวนลูป Auto Claim
-loopClaimBtn = createButton("LoopClaimBtn", string.format("⏳ วนลูป Auto Claim: [ %s ]", isAutoClaimLoop and "เปิด" or "ปิด"), UDim2.fromOffset(12, 88), isAutoClaimLoop and Color3.fromRGB(46, 204, 113) or Color3.fromRGB(45, 42, 55), function()
-    setAutoClaimLoop(not isAutoClaimLoop)
+toggleRow(pageMain, "⏳ วนลูป Auto Claim (ทุก 60 วิ)", function()
+    return G.isAutoClaimLoop
+end, function(v)
+    G.isAutoClaimLoop = v
     queueSave()
-    if isAutoClaimLoop then
-        notify("🎁 Auto Claim", "เปิดระบบวนลูปกดรับเควสอัตโนมัติ!", 2)
-    else
-        notify("🎁 Auto Claim", "ปิดระบบวนลูปกดรับเควสแล้ว", 2)
-    end
+    notify("🎁 Auto Claim", v and "เปิดวนลูปกดรับเควสอัตโนมัติ!" or "ปิดวนลูปกดรับเควสแล้ว", 2)
 end)
-
--- 3. ปุ่มใส่โค้ด
-createButton("RedeemBtn", "🏷️ ใส่โค้ดทั้งหมด (Redeem All)", UDim2.fromOffset(12, 131), Color3.fromRGB(230, 126, 34), function()
+actionButton(pageMain, "🏷️ ใส่โค้ดทั้งหมด (Redeem All)", C.orange, function()
     redeemAllCodes()
 end)
 
--- 4. ปุ่มใช้น้ำยา Luck 1 ขวด
-createButton("UseLuckBtn", "🧪 ใช้น้ำยา Luck (1 ขวด)", UDim2.fromOffset(12, 174), Color3.fromRGB(156, 39, 176), function()
+section(pageMain, "🎰 สุ่มตัวละคร", C.accent)
+actionButton(pageMain, "🧪 ใช้น้ำยา Luck (1 ขวด)", C.luck, function()
     useOneLuckPotion()
 end)
-
--- 5. ปุ่ม Auto Summon 10x (Skip)
-summonBtn = createButton("SummonBtn", "🎰 Auto Summon 10x (Skip): [ ปิด ]", UDim2.fromOffset(12, 217), Color3.fromRGB(45, 42, 55), function()
-    if isAutoSummoning then
-        stopAutoSummon()
-    else
+refreshSummonToggle = toggleRow(pageMain, "🎰 Auto Summon 10x (ข้ามอนิเมชัน)", function()
+    return state.summonToken ~= nil
+end, function(v)
+    if v then
         startAutoSummonLoop()
+    else
+        stopAutoSummon()
     end
 end)
-
--- 6. ปุ่มสลับหยุดเมื่อได้ Mythic
-stopToggleBtn = createButton("StopToggleBtn", string.format("🛑 หยุดเมื่อได้ Mythic: [ %s ]", stopOnMythicOrSecret and "เปิด" or "ปิด"), UDim2.fromOffset(12, 260), stopOnMythicOrSecret and Color3.fromRGB(155, 89, 182) or Color3.fromRGB(45, 42, 55), function()
-    stopOnMythicOrSecret = not stopOnMythicOrSecret
-    if stopOnMythicOrSecret then
-        stopToggleBtn.Text = "🛑 หยุดเมื่อได้ Mythic: [ เปิด ]"
-        stopToggleBtn.BackgroundColor3 = Color3.fromRGB(155, 89, 182)
-    else
-        stopToggleBtn.Text = "🛑 หยุดเมื่อได้ Mythic: [ ปิด ]"
-        stopToggleBtn.BackgroundColor3 = Color3.fromRGB(45, 42, 55)
-    end
+toggleRow(pageMain, "🛑 หยุดสุ่มเมื่อได้ Mythic / Secret", function()
+    return G.stopOnMythicOrSecret
+end, function(v)
+    G.stopOnMythicOrSecret = v
+    queueSave()
+end)
+toggleRow(pageMain, "🗑️ Auto Sell ตัว Rare ตอนสุ่ม", function()
+    return G.autoSellRare
+end, function(v)
+    G.autoSellRare = v
+    call("SetAutoSell", "Rare", v)
+    queueSave()
+end)
+toggleRow(pageMain, "🗑️ Auto Sell ตัว Epic ตอนสุ่ม", function()
+    return G.autoSellEpic
+end, function(v)
+    G.autoSellEpic = v
+    call("SetAutoSell", "Epic", v)
     queueSave()
 end)
 
--- 7. ปุ่มเปิดหน้าระบบร้านค้า
-createButton("ShopBtn", "🛒 ระบบร้านค้า (Merchant / Currency)", UDim2.fromOffset(12, 303), Color3.fromRGB(255, 150, 50), function()
-    shopFrame.Visible = not shopFrame.Visible
-    if shopFrame.Visible then
+-- ================= แท็บ: ฟาร์ม =================
+local function targetText()
+    local w = worldData(farmCfg.Mode, farmCfg.World)
+    local s = w and w.Stages and w.Stages[farmCfg.Stage]
+    return string.format("🎯 [%s] %s • %s (บอส: %s) [%s]",
+        tostring(farmCfg.Mode),
+        w and w.Name or ("World " .. tostring(farmCfg.World)),
+        s and s.Name or ("ด่าน " .. tostring(farmCfg.Stage)),
+        s and s.Boss or "?",
+        tostring(farmCfg.Difficulty))
+end
+
+local farmInfoLabel = infoText(pageFarm, targetText(), C.gold, 34)
+
+section(pageFarm, "1. โหมดเกม")
+local refreshModeSeg = segmented(pageFarm, MODES, {
+    get = function() return farmCfg.Mode end,
+    set = function(id)
+        if farmCfg.Mode ~= id then
+            farmCfg.Mode = id
+            farmCfg.World = 1
+            farmCfg.Stage = 1
+        end
+        refreshFarmUI()
+        queueSave()
+    end,
+    color = C.red
+})
+
+section(pageFarm, "2. World (แมพ)")
+local refreshWorldSeg = segmented(pageFarm, { { id = 1 }, { id = 2 }, { id = 3 }, { id = 4 } }, {
+    height = 42,
+    get = function() return farmCfg.World end,
+    set = function(id)
+        farmCfg.World = id
+        farmCfg.Stage = 1
+        refreshFarmUI()
+        queueSave()
+    end,
+    available = function(id) return worldData(farmCfg.Mode, id) ~= nil end,
+    label = function(id)
+        local w = worldData(farmCfg.Mode, id)
+        return w and (tostring(id) .. ". " .. w.Name) or (tostring(id) .. ". —")
+    end,
+    color = C.blue
+})
+
+section(pageFarm, "3. ด่าน (Stage)")
+local refreshStageSeg = segmented(pageFarm, {
+    { id = 1 }, { id = 2 }, { id = 3 }, { id = 4 }, { id = 5 }, { id = 6 }
+}, {
+    get = function() return farmCfg.Stage end,
+    set = function(id)
+        farmCfg.Stage = id
+        refreshFarmUI()
+        queueSave()
+    end,
+    available = function(id) return id <= stageCount(farmCfg.Mode, farmCfg.World) end,
+    color = C.purple
+})
+
+section(pageFarm, "4. ความยาก")
+local refreshDiffSeg = segmented(pageFarm, DIFFS, {
+    get = function() return farmCfg.Difficulty end,
+    set = function(id)
+        farmCfg.Difficulty = id
+        refreshFarmUI()
+        queueSave()
+    end,
+    colorFn = function(id) return DIFF_COLOR[id] end
+})
+
+refreshFarmUI = function()
+    sanitizeFarm()
+    refreshModeSeg()
+    refreshWorldSeg()
+    refreshStageSeg()
+    refreshDiffSeg()
+    farmInfoLabel.Text = targetText()
+end
+
+section(pageFarm, "5. ตัวช่วยการต่อสู้", C.gold)
+toggleRow(pageFarm, "⚡ Auto Skills (บอทกดสกิลเอง)", function()
+    return farmCfg.AutoSkills
+end, function(v)
+    farmCfg.AutoSkills = v
+    call("TeamAuto", v)
+    queueSave()
+end)
+
+local refreshAutoReplay, refreshAutoNext
+refreshAutoReplay = toggleRow(pageFarm, "🔄 Auto Replay (เล่นด่านเดิมซ้ำ)", function()
+    return farmCfg.AutoReplay
+end, function(v)
+    farmCfg.AutoReplay = v
+    if v then
+        farmCfg.AutoNext = false
+        if refreshAutoNext then refreshAutoNext() end
+        call("BattleSetting", "AutoReplay", true)
+        call("BattleSetting", "AutoNext", false)
+    else
+        call("BattleSetting", "AutoReplay", false)
+    end
+    queueSave()
+end)
+refreshAutoNext = toggleRow(pageFarm, "⏩ Auto Next (ไปด่านถัดไปเมื่อชนะ)", function()
+    return farmCfg.AutoNext
+end, function(v)
+    farmCfg.AutoNext = v
+    if v then
+        farmCfg.AutoReplay = false
+        if refreshAutoReplay then refreshAutoReplay() end
+        call("BattleSetting", "AutoNext", true)
+        call("BattleSetting", "AutoReplay", false)
+    else
+        call("BattleSetting", "AutoNext", false)
+    end
+    queueSave()
+end)
+toggleRow(pageFarm, "💨 ลดแล็ก (Low Detail / ปิด VFX)", function()
+    return farmCfg.LowGraphics
+end, function(v)
+    farmCfg.LowGraphics = v
+    call("BattleSetting", "LowDetail", v)
+    call("BattleSetting", "NoVfx", v)
+    call("BattleSetting", "NoNumbers", v)
+    queueSave()
+end)
+toggleRow(pageFarm, "🔒 เล่นคนเดียว (Solo ปิดห้อง)", function()
+    return farmCfg.Solo
+end, function(v)
+    farmCfg.Solo = v
+    queueSave()
+end)
+
+section(pageFarm, "6. เริ่มฟาร์ม", C.red)
+toggleRow(pageFarm, "🔁 วนลูป Auto Farm (เข้าด่านซ้ำอัตโนมัติ)", function()
+    return farmCfg.Enabled
+end, function(v)
+    farmCfg.Enabled = v
+    queueSave()
+    if v then
+        notify("⚔️ Auto Farm", "เปิดวนลูป Auto Farm!", 3)
+        if not IN_BATTLE then
+            enterAndStartAutoPlay(true)
+        end
+    else
+        notify("⚔️ Auto Farm", "ปิดวนลูป Auto Farm แล้ว", 2)
+    end
+end)
+actionButton(pageFarm, "🚀 เริ่ม Auto Play เดี๋ยวนี้", Color3.fromRGB(46, 204, 113), function()
+    enterAndStartAutoPlay(true)
+end)
+actionButton(pageFarm, "🚪 ออกจากห้องเดิม", Color3.fromRGB(70, 64, 82), function()
+    leaveCurrentRoom()
+end)
+
+-- ================= แท็บ: ร้านค้า =================
+local shopView = "Currency"
+local shopTimerLabel = infoText(pageShop, "⏳ Merchant: --:--:--  |  Currency: --:--:--", C.sub, 20)
+
+segmented(pageShop, {
+    { id = "Merchant", text = "🛒 Merchant" },
+    { id = "Currency", text = "🪙 Currency Shop" }
+}, {
+    get = function() return shopView end,
+    set = function(id)
+        shopView = id
+        task.spawn(renderShop)
+    end,
+    color = C.shop
+})
+
+actionButton(pageShop, "🔄 รีเฟรชร้านค้า", C.steel, function()
+    renderShop(true)
+    setStatus("🛒 อัปเดตร้านค้าแล้ว")
+end)
+
+local shopList = new("Frame", {
+    BackgroundTransparency = 1,
+    Size = UDim2.new(1, 0, 0, 0),
+    AutomaticSize = Enum.AutomaticSize.Y,
+    LayoutOrder = nextOrder()
+}, pageShop)
+new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, shopList)
+
+local function clearShopList()
+    for _, ch in ipairs(shopList:GetChildren()) do
+        if ch:IsA("GuiObject") then
+            ch:Destroy()
+        end
+    end
+end
+
+local function listLabel(text, color, order)
+    return new("TextLabel", {
+        BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 0, 24),
+        Font = Enum.Font.GothamBold,
+        Text = text,
+        TextColor3 = color or C.text,
+        TextSize = 14,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        LayoutOrder = order
+    }, shopList)
+end
+
+local function shopCard(order, title, sub, titleColor, canBuy, btnText, onBuy)
+    local card = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 52),
+        BackgroundColor3 = canBuy and C.card or C.disabled,
+        BorderSizePixel = 0,
+        LayoutOrder = order
+    }, shopList)
+    corner(card, 8)
+
+    local t = new("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(10, 4),
+        Size = UDim2.new(1, -104, 0, 24),
+        Font = Enum.Font.GothamBold,
+        Text = title,
+        TextColor3 = canBuy and (titleColor or C.text) or C.dim,
+        TextXAlignment = Enum.TextXAlignment.Left
+    }, card)
+    textFit(t, 13, 8)
+
+    local s = new("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(10, 28),
+        Size = UDim2.new(1, -104, 0, 20),
+        Font = Enum.Font.Gotham,
+        Text = sub,
+        TextColor3 = C.sub,
+        TextXAlignment = Enum.TextXAlignment.Left
+    }, card)
+    textFit(s, 12, 7)
+
+    local b = new("TextButton", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -8, 0.5, 0),
+        Size = UDim2.fromOffset(82, 36),
+        BackgroundColor3 = canBuy and C.on or C.off,
+        BorderSizePixel = 0,
+        AutoButtonColor = canBuy,
+        Font = Enum.Font.GothamBold,
+        Text = btnText,
+        TextColor3 = canBuy and C.white or C.dim
+    }, card)
+    corner(b, 8)
+    textFit(b, 13, 8)
+    if canBuy and onBuy then
+        bindTap(b, onBuy)
+    end
+    return card
+end
+
+local renderGen = 0
+renderShop = function(forceFetch)
+    renderGen = renderGen + 1
+    local my = renderGen
+    local view = shopView
+
+    if view == "Merchant" then
+        local info
+        if forceFetch or not cachedMerchantInfo then
+            info = fetchMerchantInfo()
+        else
+            info = cachedMerchantInfo
+        end
+        -- ถ้ามีการเรนเดอร์ใหม่ซ้อนเข้ามาระหว่างรอเซิร์ฟ ให้ทิ้งรอบนี้ (กันการ์ดซ้ำ)
+        if my ~= renderGen or not alive() then return end
+        clearShopList()
+
+        if not info or type(info.Stock) ~= "table" then
+            listLabel("ไม่พบข้อมูลสต็อก กดรีเฟรชอีกครั้ง", C.dim, 1)
+            return
+        end
+
+        for i, offer in ipairs(info.Stock) do
+            if type(offer) == "table" then
+                local left = getLeftStock(offer, info.Bought)
+                local cur = offer.Currency or "Gold"
+                local curIcon = (cur == "Gold") and "🟡 Gold" or "💎 Gems"
+                local itemName = tostring(offer.Item or "Item")
+                local title = string.format("%s (x%s)", itemName, tostring(offer.Amount or 1))
+                local sub = string.format("ราคา %s %s • เหลือ %s", tostring(offer.Price or 0), curIcon, tostring(left))
+                shopCard(i, title, sub, offer.Rare and C.gold or C.text, left > 0, left > 0 and "ซื้อ" or "หมดแล้ว", function()
+                    local ok, err = buySingleMerchantItem(offer.Key, 1)
+                    if ok then
+                        notify("🛒 ซื้อสำเร็จ", "ซื้อ " .. itemName .. " เรียบร้อย!", 2)
+                        fetchMerchantInfo()
+                        task.spawn(renderShop)
+                    else
+                        notify("🛒 ไม่สำเร็จ", err or "ซื้อไม่ได้", 3)
+                    end
+                end)
+            end
+        end
+    else
+        local okState, st = call("GetState")
+        if my ~= renderGen or not alive() then return end
+        st = (okState and type(st) == "table") and st or {}
+        local activeColors = getActiveColors()
+        clearShopList()
+
+        local order = 0
+        local function nextListOrder()
+            order = order + 1
+            return order
+        end
+
+        local function renderOffer(offer)
+            local left = getCurrencyShopLeft(offer, st)
+            local isAvailable = (not offer.Rotates) or (activeColors[offer.Item] == true)
+            local note = ""
+            if offer.Rotates then
+                note = isAvailable and " [รอบนี้ขาย]" or " [รอบนี้ปิด]"
+            end
+            local curIcon = (offer.Currency == "Gold") and "🟡 Gold" or "💎 Gems"
+            local itemName = tostring(offer.Name or offer.Item)
+            local sub = string.format("ราคา %s %s • เหลือ %s/%s", tostring(offer.Price), curIcon, tostring(left), tostring(offer.Stock or 1))
+            local canBuy = isAvailable and left > 0
+            local btnText = (not isAvailable) and "ปิดขาย" or (left > 0 and "ซื้อ" or "หมดแล้ว")
+            shopCard(nextListOrder(), itemName .. note, sub, C.text, canBuy, btnText, function()
+                local ok, err = buyCurrencyShopItem(offer, 1)
+                if ok then
+                    notify("🪙 ซื้อสำเร็จ", "ซื้อ " .. itemName .. " เรียบร้อย!", 2)
+                    task.spawn(renderShop)
+                else
+                    notify("🪙 ไม่สำเร็จ", err or "ซื้อไม่ได้", 3)
+                end
+            end)
+        end
+
+        listLabel("🪙 Gold Shop (ใช้ Gold)", C.gold, nextListOrder())
+        for _, offer in ipairs(currencyShopDB.Gold) do
+            renderOffer(offer)
+        end
+        listLabel("💎 Gem Shop (ใช้ Gems)", C.accent, nextListOrder())
+        for _, offer in ipairs(currencyShopDB.Gems) do
+            renderOffer(offer)
+        end
+    end
+end
+
+-- ================= แท็บ: ตั้งค่า =================
+local function cfgToggle(label, tbl, key)
+    return toggleRow(pageSet, label, function()
+        return tbl[key]
+    end, function(v)
+        tbl[key] = v
+        queueSave()  -- ✨ บันทึกเมื่อเปลี่ยนค่า
+    end)
+end
+
+section(pageSet, "🔁 Auto Buy อัตโนมัติ", C.on)
+toggleRow(pageSet, "⏳ วนลูป Auto Buy ทุกร้าน (ทุก 30 วิ)", function()
+    return G.isAutoShopLoop
+end, function(v)
+    G.isAutoShopLoop = v
+    queueSave()
+    notify("🛒 Auto Buy ร้านค้า", v and "เปิดซื้ออัตโนมัติทั้ง Merchant และ Currency Shop!" or "ปิดซื้ออัตโนมัติแล้ว", 3)
+end)
+toggleRow(pageSet, "🔔 ร้านรีเซ็ต → จบด่านแล้วกลับไปซื้อ", function()
+    return G.restockExitBattle
+end, function(v)
+    G.restockExitBattle = v
+    queueSave()
+end)
+actionButton(pageSet, "⚡ ซื้อของที่เลือกใน Currency Shop เดี๋ยวนี้", C.gold, function()
+    runCurrencyShopAutoBuy(false)
+end, C.dark)
+actionButton(pageSet, "⚡ ซื้อของที่เลือกใน Merchant เดี๋ยวนี้", C.orange, function()
+    runMerchantAutoBuy(false)
+end)
+
+section(pageSet, "🪙 Currency Shop (Gold & Gems)", C.gold)
+cfgToggle("💰 Gold Shop ทั้งหมด (Dango / Dust / Rune)", currencyShopConfig, "buyAllGold")
+cfgToggle("📜 Skill Scroll (150 Gems)", currencyShopConfig, "buyScroll")
+cfgToggle("🔮 Trait Crystal (100 Gems)", currencyShopConfig, "buyTrait")
+cfgToggle("⭐ Star Shard (300 Gems)", currencyShopConfig, "buyStar")
+cfgToggle("💎 หินธาตุหมุนเวียน (5 สี)", currencyShopConfig, "buyRotatingGems")
+cfgToggle("👥 Shards ตัวละคร (Mythic / Legendary / Epic)", currencyShopConfig, "buyShards")
+
+section(pageSet, "🛒 Merchant (Rare Goods)", C.shop)
+cfgToggle("💰 ของที่ใช้ Gold ทั้งหมด", merchantConfig, "buyAllGold")
+cfgToggle("🧪 น้ำยา Luck (Super / Ultra)", merchantConfig, "buyLuck")
+cfgToggle("🌈 Rainbow Shard", merchantConfig, "buyRainbow")
+cfgToggle("🔮 Trait Crystal", merchantConfig, "buyTrait")
+cfgToggle("⭐ Star Shard", merchantConfig, "buyStar")
+cfgToggle("🧬 ไอเทม Evo ทั้งหมด", merchantConfig, "buyEvo")
+cfgToggle("⚡ Stat Chip (ปกติ / Super)", merchantConfig, "buyChips")
+
+section(pageSet, "💾 สคริปต์", C.sub)
+local saveInfo
+if not canFile then
+    saveInfo = "⚠️ Executor ไม่รองรับ writefile: ตั้งค่าจะไม่ถูกบันทึก"
+elseif savedData then
+    saveInfo = "💾 โหลดการตั้งค่าที่บันทึกไว้เรียบร้อย"
+else
+    saveInfo = "💾 ยังไม่มีไฟล์ตั้งค่า (แก้ค่าแล้วจะ auto-save)"
+end
+infoText(pageSet, saveInfo, canFile and Color3.fromRGB(120, 220, 120) or C.gold, 20)
+actionButton(pageSet, "💾 บันทึกตั้งค่าตอนนี้", C.steel, function()
+    if persistCurrentSettings() then
+        notify("💾 Settings", "บันทึกแล้ว", 2)
+    else
+        notify("💾 Settings", "บันทึกไม่สำเร็จ", 3)
+    end
+end)
+actionButton(pageSet, "🛑 ปิดสคริปต์ทั้งหมด (หยุดทุกระบบ)", C.danger, function()
+    persistCurrentSettings()
+    notify("Anime Ashura Hub", "ปิดสคริปต์แล้ว รันใหม่เพื่อเปิดอีกครั้ง", 3)
+    _G.__AAH_CLEANUP()
+end)
+
+-- ----------------- LAYOUT -----------------
+local function layoutWindow(center)
+    if not screenGui then return end
+    local w, h = windowSize()
+    main.Size = UDim2.fromOffset(w, h)
+    local x, y
+    if center then
+        local s = screenSize()
+        x, y = (s.X - w) / 2, (s.Y - h) / 2
+    else
+        x, y = main.Position.X.Offset, main.Position.Y.Offset
+    end
+    x, y = clampXY(x, y, w, h)
+    main.Position = UDim2.fromOffset(x, y)
+
+    local fx, fy = clampXY(floatBtn.Position.X.Offset, floatBtn.Position.Y.Offset, 52, 52)
+    floatBtn.Position = UDim2.fromOffset(fx, fy)
+end
+
+task.wait()
+do
+    local s = screenSize()
+    floatBtn.Position = UDim2.fromOffset(8, math.floor(s.Y * 0.4))
+end
+layoutWindow(true)
+track(screenGui:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+    layoutWindow(false)
+end))
+
+switchTab("main")
+refreshFarmUI()
+setWindowOpen(not G.uiMinimized, false)
+
+-- ==========================================
+-- 17. BACKGROUND TASKS
+-- ==========================================
+
+-- จับสถานะการวาร์ป: ระหว่างวาร์ปจะไม่สั่งเข้าห้องซ้ำ และบันทึกค่าก่อนเซิร์ฟเปลี่ยน
+track(LocalPlayer.OnTeleport:Connect(function(teleportState)
+    if teleportState == Enum.TeleportState.Failed then
+        state.teleporting = false
+        setStatus("⚠️ วาร์ปไม่สำเร็จ")
+    else
+        if not state.teleporting then
+            persistCurrentSettings()
+        end
+        state.teleporting = true
+        state.teleportAt = os.clock()
+        setStatus("🚀 กำลังวาร์ป...")
+    end
+end))
+
+-- Task: วนลูป Auto Claim เบื้องหลัง
+loop("AutoClaim", 60, function()
+    if G.isAutoClaimLoop then
+        claimAllEverything(true)
+    end
+end)
+
+-- Task: วนลูป Auto Buy ทุกร้านค้าเบื้องหลัง
+loop("AutoShop", 30, function()
+    if G.isAutoShopLoop then
+        runMerchantAutoBuy(true)
+        runCurrencyShopAutoBuy(true)
+    end
+end)
+
+-- Task: นาฬิกานับถอยหลังร้านค้า (ทำงานเฉพาะตอนเปิดแท็บร้าน)
+local timerState = { lastFetch = 0, hour = nil }
+loop("ShopTimer", 1, function()
+    if not (main.Visible and currentTab == "shop") then
+        timerState.hour = nil
+        return
+    end
+    local now = getServerTime()
+    local info = cachedMerchantInfo
+    if not info and os.clock() - timerState.lastFetch > 15 then
+        timerState.lastFetch = os.clock()
+        info = fetchMerchantInfo()
+    end
+
+    local ends = info and tonumber(info.EndsAt)
+    local mRemain = ends and (ends - now) or 0
+    local cRemain = 3600 - (now % 3600)
+    shopTimerLabel.Text = string.format("⏳ Merchant: %s  |  Currency: %s", formatClock(mRemain), formatClock(cRemain))
+
+    if ends and mRemain <= 0 and os.clock() - timerState.lastFetch > 10 then
+        timerState.lastFetch = os.clock()
+        task.wait(1.5)
         fetchMerchantInfo()
-        renderMerchantCards()
-        renderCurrencyShopCards()
+        if shopView == "Merchant" then renderShop() end
     end
+
+    local hour = math.floor(now / 3600)
+    if timerState.hour and hour ~= timerState.hour and shopView == "Currency" then
+        task.wait(1.5)
+        renderShop()
+    end
+    timerState.hour = hour
 end)
 
--- 8. ปุ่มเปิดหน้าระบบ Auto Play & Auto Farm
-createButton("AutoFarmBtn", "⚔️ ระบบ Auto Play (เข้าฟาม)", UDim2.fromOffset(12, 346), Color3.fromRGB(231, 76, 60), function()
-    autoFarmFrame.Visible = not autoFarmFrame.Visible
-    if autoFarmFrame.Visible then
-        updateFarmInfoText()
-    end
-end)
+if not IN_BATTLE then
+    -- ✨ Lobby: ซื้อของที่ค้าง (Restock) ก่อน แล้วค่อยเข้าด่าน และวนเข้าด่านใหม่อัตโนมัติ
+    task.spawn(function()
+        getHRP(20)
+        if not sleep(3) then return end
 
--- 9. ปุ่มปิดเมนู
-createButton("CloseBtn", "ปิดเมนู (X)", UDim2.fromOffset(12, 389), Color3.fromRGB(30, 26, 35), function()
-    screenGui:Destroy()
-end)
+        if G.restockPending then
+            G.restockPending = false
+            persistCurrentSettings()
+            notify("🛒 Restock", "กลับมาที่ Lobby แล้ว! กำลังซื้อของ...", 3)
+            sleep(2)
+            runMerchantAutoBuy(false)
+            sleep(0.5)
+            runCurrencyShopAutoBuy(false)
+            sleep(1)
+        end
+
+        -- ✨ ถ้าบันทึกไว้ว่าเปิด Auto Farm อยู่ ให้เริ่มเข้าห้องทันที
+        if farmCfg.Enabled and alive() then
+            print("[AutoFarm Loop] บันทึกไว้ว่าเปิดอยู่ → กำลังเข้าห้องอัตโนมัติ...")
+            enterAndStartAutoPlay(false)
+        end
+
+        -- ✨ Lobby Re-entry Loop: ทุก 5 วินาที ถ้า Farm เปิดและไม่ได้กำลังเข้าห้อง/วาร์ป
+        -- จะลองเข้าห้องใหม่ โดยเว้นอย่างน้อย 30 วินาทีจากครั้งก่อน เพื่อไม่ไปยกเลิกการวาร์ปที่กำลังเกิดขึ้น
+        loop("LobbyFarm", 5, function()
+            if state.teleporting and os.clock() - state.teleportAt > 60 then
+                state.teleporting = false
+            end
+            if farmCfg.Enabled and not state.startingRoom and not state.teleporting
+                and os.clock() - state.lastStartAttempt > 30 then
+                print("[AutoFarm Loop] อยู่ใน Lobby + Farm เปิดอยู่ → เข้าห้องอัตโนมัติ")
+                enterAndStartAutoPlay(false)
+            end
+        end)
+    end)
+else
+    -- ==========================================
+    -- ✨ Battle Place: Auto Skills + กดปุ่มผลลัพธ์ + Restock Exit
+    -- ==========================================
+    local RESULT_KEYWORDS = {
+        replay = { { "replay", "play again", "again", "retry" }, { "vote" } },
+        next = { { "next" }, { "vote" } },
+        lobby = { { "lobby", "return" }, { "leave", "exit" } }
+    }
+    -- คำที่ห้ามกด: กันไปกดสวิตช์ Auto ของเกมเอง หรือปุ่มข้ามเวฟกลางด่าน
+    local CLICK_EXCLUDE = { "auto", "wave", "skip", "setting" }
+    local clickedAt = setmetatable({}, { __mode = "k" })
+
+    local function keywordPriority(txt, groups, maxPriority)
+        for _, w in ipairs(CLICK_EXCLUDE) do
+            if string.find(txt, w, 1, true) then
+                return nil
+            end
+        end
+        for pri, words in ipairs(groups) do
+            if maxPriority and pri > maxPriority then
+                return nil
+            end
+            for _, w in ipairs(words) do
+                if string.find(txt, w, 1, true) then
+                    return pri
+                end
+            end
+        end
+        return nil
+    end
+
+    -- หาปุ่มที่ตรงคำค้นที่สุดใน PlayerGui (ข้าม GUI ของสคริปต์เอง)
+    -- ปุ่มที่เพิ่งกดจะไม่ถูกกดซ้ำจนกว่าจะหายไปจากจอ หรือผ่านไป 20 วินาที
+    local function findResultButton(kind, maxPriority)
+        local groups = RESULT_KEYWORDS[kind]
+        local pGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        if not (groups and pGui) then
+            return nil
+        end
+        local best, bestPri = nil, math.huge
+        local now = os.clock()
+        for _, g in ipairs(pGui:GetChildren()) do
+            if g:IsA("ScreenGui") and g.Enabled and g ~= screenGui then
+                for _, d in ipairs(g:GetDescendants()) do
+                    if d:IsA("GuiButton") then
+                        local last = clickedAt[d]
+                        if last and not isShown(d) then
+                            clickedAt[d] = nil
+                            last = nil
+                        end
+                        if not last or now - last > 20 then
+                            local txt = buttonText(d)
+                            if txt ~= "" then
+                                local pri = keywordPriority(txt, groups, maxPriority)
+                                if pri and pri < bestPri and isShown(d) then
+                                    best, bestPri = d, pri
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        return best
+    end
+
+    -- ถ้าบันทึกไว้ว่ามี Restock ค้าง (เช่นโดนวาร์ปไปด่านใหม่ก่อนออกทัน) ให้ปิด Replay/Next ต่อ
+    if G.restockPending then
+        state.restockSince = os.clock()
+        task.spawn(function()
+            call("BattleSetting", "AutoReplay", false)
+            call("BattleSetting", "AutoNext", false)
+        end)
+    end
+
+    local lastTeamAuto = 0
+    loop("BattleAuto", 2.5, function()
+        if farmCfg.AutoSkills and os.clock() - lastTeamAuto > 8 then
+            lastTeamAuto = os.clock()
+            call("TeamAuto", true)
+        end
+
+        local kind, maxPri = nil, nil
+        if G.restockPending then
+            kind = "lobby"
+            -- 4 นาทีแรกกดเฉพาะปุ่ม Lobby/Return (หน้าจบด่าน) หลังจากนั้นยอมกด Leave/Exit ด้วย
+            maxPri = (state.restockSince and os.clock() - state.restockSince > 240) and 2 or 1
+        elseif farmCfg.AutoNext then
+            kind = "next"
+        elseif farmCfg.AutoReplay or farmCfg.Enabled then
+            kind = "replay"
+        end
+        if not kind then
+            return
+        end
+
+        local btn = findResultButton(kind, maxPri)
+        if btn then
+            clickedAt[btn] = os.clock()
+            local pressed = pressButton(btn)
+            setStatus("🖱️ กดปุ่ม \"" .. buttonText(btn) .. "\"" .. (pressed and "" or " (ไม่สำเร็จ)"))
+        end
+    end)
+
+    -- ✨ Restock Exit Watcher: ร้านรีเซ็ตระหว่างอยู่ในด่าน → ตั้งธงค้างไว้ แล้วกลับ Lobby เมื่อจบรอบ
+    local lastCurrencyHour = math.floor(getServerTime() / 3600)
+    local lastMerchantEndsAt = nil
+    task.spawn(function()
+        local info = fetchMerchantInfo()
+        if info and tonumber(info.EndsAt) then
+            lastMerchantEndsAt = tonumber(info.EndsAt)
+        end
+    end)
+
+    loop("RestockWatch", 5, function()
+        local now = getServerTime()
+        local hour = math.floor(now / 3600)
+
+        if G.restockPending then
+            -- ถ้ารอนานเกิน 10 นาทีแล้วยังไม่กลับ Lobby ให้วาร์ปกลับเอง
+            if state.restockSince and os.clock() - state.restockSince > 600 and not state.teleporting then
+                state.restockSince = os.clock()
+                notify("🛒 Restock", "รอนานเกิน 10 นาที → วาร์ปกลับ Lobby", 4)
+                pcall(function() TeleportService:Teleport(LOBBY_PLACE, LocalPlayer) end)
+            end
+            return
+        end
+
+        if not (G.restockExitBattle and G.isAutoShopLoop) then
+            -- ระบบปิดอยู่: เลื่อนตัวจำเวลาไปด้วย เปิดทีหลังจะได้ไม่ออกด่านทันทีโดยไม่จำเป็น
+            lastCurrencyHour = hour
+            if lastMerchantEndsAt and now >= lastMerchantEndsAt then
+                lastMerchantEndsAt = lastMerchantEndsAt + 10800
+            end
+            return
+        end
+
+        local currencyRestocked = (hour ~= lastCurrencyHour)
+        local merchantRestocked = (lastMerchantEndsAt ~= nil and now >= lastMerchantEndsAt)
+        if not (currencyRestocked or merchantRestocked) then
+            return
+        end
+
+        lastCurrencyHour = hour
+        if merchantRestocked then
+            lastMerchantEndsAt = lastMerchantEndsAt + 10800
+            task.delay(5, function()
+                local info = fetchMerchantInfo()
+                if info and tonumber(info.EndsAt) then
+                    lastMerchantEndsAt = tonumber(info.EndsAt)
+                end
+            end)
+        end
+
+        G.restockPending = true
+        state.restockSince = os.clock()
+        persistCurrentSettings()
+        notify("🛒 Restock!", "ร้านรีเซ็ตแล้ว! จบรอบนี้จะกลับ Lobby ไปซื้อของ", 5)
+
+        -- ปิด AutoReplay / AutoNext เพื่อให้ด่านจบแล้วกลับ Lobby
+        call("BattleSetting", "AutoReplay", false)
+        call("BattleSetting", "AutoNext", false)
+    end)
+end
 
 -- ✨ บันทึกค่าเริ่มต้นเฉพาะเมื่อยังไม่เคยมีไฟล์ save
 if not savedData then
     persistCurrentSettings()
 end
 
-local loadMsg = savedData and "โหลดการตั้งค่าที่บันทึกไว้เรียบร้อย! 💾" or "พร้อมใช้งาน! ตั้งค่าแล้วจะ auto-save 💾"
-notify("Anime Ashura Hub v2.0", loadMsg, 4)
+local loadMsg = savedData and "โหลดการตั้งค่าที่บันทึกไว้แล้ว 💾" or "พร้อมใช้งาน! แก้ค่าแล้วจะ auto-save 💾"
+notify("Anime Ashura Hub v2.1 📱", loadMsg, 4)
